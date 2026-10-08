@@ -4,20 +4,21 @@ use of_car_reader::{
     CarBlockReader,
     node::{Node, decode_node},
     slot_ranges::{
-        SLOT_RANGE_ENTRY_SIZE, SLOTS_PER_EPOCH, SlotRange, SlotRangeWithPreviousBlockhash,
-        decode_slot_range_entry, epoch_for_slot, slot_in_epoch,
+        EpochSchedule, SLOT_RANGE_ENTRY_SIZE, SLOTS_PER_EPOCH, SlotRange,
+        SlotRangeWithPreviousBlockhash, decode_slot_range_entry,
         write_slot_ranges_raw as write_slot_ranges_raw_entries,
         write_slot_ranges_v2_raw as write_slot_ranges_v2_raw_entries,
     },
 };
 use of_slot_ranges::{
-    AsyncCompactIndex, BuildSlotRangesConfig, LocalFileRangeReader, build_slot_ranges_from_indexes,
-    decode_car_header_total_size,
+    AsyncCompactIndex, BuildSlotRangesConfig, LocalFileRangeReader, RangeReader,
+    build_slot_ranges_from_indexes, decode_car_header_total_size,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, RANGE};
 use std::fs;
 use std::fs::File;
+use std::future::{Ready, ready};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -76,6 +77,15 @@ struct Cli {
     /// is provided only to decode the CAR header length.
     #[arg(long)]
     raw_only: bool,
+
+    /// Cluster whose epoch schedule maps epochs to slots (mainnet, testnet or devnet).
+    #[arg(long, default_value = "mainnet", value_parser = parse_epoch_schedule)]
+    cluster: EpochSchedule,
+}
+
+fn parse_epoch_schedule(cluster: &str) -> Result<EpochSchedule, String> {
+    EpochSchedule::for_cluster(cluster)
+        .ok_or_else(|| format!("unknown cluster {cluster:?} (expected mainnet, testnet or devnet)"))
 }
 
 fn main() -> Result<()> {
@@ -154,19 +164,29 @@ fn main() -> Result<()> {
             let car_hdr = car_header_total_size(&http, epoch, cli.cars_dir.as_deref())?;
             eprintln!("epoch={epoch}: car_header_size={car_hdr}");
 
+            let mut car = match find_local_car(epoch, cli.cars_dir.as_deref()) {
+                Some(path) => CarReader::Local(LocalFileRangeReader::open(&path)?),
+                None => CarReader::Remote {
+                    http: http.clone(),
+                    url: remote_car_url(epoch),
+                },
+            };
+
             let t0 = std::time::Instant::now();
             let output = futures::executor::block_on(build_slot_ranges_from_indexes(
                 epoch,
                 car_hdr,
                 &mut slot_index,
                 &mut cid_index,
+                &mut car,
                 BuildSlotRangesConfig {
                     max_bucket_payload_bytes: MAX_BUCKET_SIZE,
                     allow_node_read_fallback: true,
+                    epoch_schedule: cli.cluster,
                 },
             ))?;
             eprintln!(
-                "epoch={epoch}: done build ranges in {:.2}s present_slots={} slot_bucket_read={} MiB cid_bucket_read={} MiB max_slot_bucket={} MiB max_cid_bucket={} MiB slot_node_fallbacks={} cid_node_fallbacks={}",
+                "epoch={epoch}: done build ranges in {:.2}s present_slots={} slot_bucket_read={} MiB cid_bucket_read={} MiB max_slot_bucket={} MiB max_cid_bucket={} MiB slot_node_fallbacks={} cid_node_fallbacks={} slot_index_false_positives={}",
                 t0.elapsed().as_secs_f64(),
                 output.stats.present_slots,
                 output.stats.slot_bucket_payload_bytes_read / (1024 * 1024),
@@ -175,6 +195,7 @@ fn main() -> Result<()> {
                 output.stats.max_cid_bucket_payload_bytes / (1024 * 1024),
                 output.stats.slot_node_read_fallbacks,
                 output.stats.cid_node_read_fallbacks,
+                output.stats.slot_index_false_positives,
             );
 
             eprintln!("epoch={epoch}: write {}", out_path.display());
@@ -217,6 +238,7 @@ fn main() -> Result<()> {
             let v2 = build_slot_ranges_v2_from_archive_v2_sidecars(
                 &epoch_dir,
                 epoch,
+                cli.cluster,
                 &raw_ranges,
                 initial_previous_blockhash,
             )?;
@@ -231,6 +253,7 @@ fn main() -> Result<()> {
             let v2 = build_slot_ranges_v2_from_local_car(
                 &local_car_path,
                 epoch,
+                cli.cluster,
                 previous_epoch_last_blockhash,
             )?;
             previous_epoch_last_blockhash = v2.last_blockhash;
@@ -318,6 +341,7 @@ struct ArchiveV2BlockIndexRow {
 fn build_slot_ranges_v2_from_archive_v2_sidecars(
     epoch_dir: &Path,
     epoch: u64,
+    schedule: EpochSchedule,
     raw_ranges: &[SlotRange],
     initial_previous_blockhash: Option<[u8; 32]>,
 ) -> Result<SlotRangesV2Build> {
@@ -330,6 +354,7 @@ fn build_slot_ranges_v2_from_archive_v2_sidecars(
         return build_slot_ranges_v2_from_blockhash_registry_sidecar(
             epoch_dir,
             epoch,
+            schedule,
             raw_ranges,
             initial_previous_blockhash,
         );
@@ -349,7 +374,7 @@ fn build_slot_ranges_v2_from_archive_v2_sidecars(
     let mut present_slots = 0u64;
 
     for row in rows {
-        if epoch_for_slot(row.slot) != epoch {
+        if schedule.epoch(row.slot) != Some(epoch) {
             continue;
         }
         let hash_index = row
@@ -365,8 +390,10 @@ fn build_slot_ranges_v2_from_archive_v2_sidecars(
             )
         })?;
 
-        let idx =
-            usize::try_from(slot_in_epoch(row.slot)).context("slot-in-epoch exceeds usize")?;
+        let idx = schedule
+            .slot_in_epoch(row.slot)
+            .and_then(|slot| usize::try_from(slot).ok())
+            .context("slot-in-epoch exceeds usize")?;
         let range = raw_ranges[idx];
         if range.is_empty() {
             eprintln!(
@@ -399,6 +426,7 @@ fn build_slot_ranges_v2_from_archive_v2_sidecars(
 fn build_slot_ranges_v2_from_blockhash_registry_sidecar(
     epoch_dir: &Path,
     epoch: u64,
+    schedule: EpochSchedule,
     raw_ranges: &[SlotRange],
     initial_previous_blockhash: Option<[u8; 32]>,
 ) -> Result<SlotRangesV2Build> {
@@ -417,9 +445,9 @@ fn build_slot_ranges_v2_from_blockhash_registry_sidecar(
     let mut previous_blockhash = initial_previous_blockhash.or(genesis_previous_blockhash);
     let mut last_blockhash = None;
     let mut block_i = 0usize;
-    let epoch_start = epoch
-        .checked_mul(SLOTS_PER_EPOCH)
-        .ok_or_else(|| anyhow!("epoch start slot overflow for epoch {epoch}"))?;
+    let epoch_start = schedule
+        .first_slot(epoch)
+        .ok_or_else(|| anyhow!("epoch {epoch} is a warmup epoch or overflows"))?;
 
     for (slot_in_epoch, range) in raw_ranges.iter().copied().enumerate() {
         if range.is_empty() {
@@ -654,6 +682,7 @@ fn find_archive_v2_blockhash_dir(
 fn build_slot_ranges_v2_from_local_car(
     path: &Path,
     epoch: u64,
+    schedule: EpochSchedule,
     initial_previous_blockhash: Option<[u8; 32]>,
 ) -> Result<SlotRangesV2Build> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -701,13 +730,15 @@ fn build_slot_ranges_v2_from_local_car(
                     .checked_add(entry.total_len as u64)
                     .ok_or_else(|| anyhow!("CAR range end overflow"))?;
 
-                if epoch_for_slot(block.slot) == epoch {
+                if schedule.epoch(block.slot) == Some(epoch) {
                     let len = u32::try_from(end.saturating_sub(start))
                         .context("CAR block range exceeds u32")?;
                     let previous = previous_blockhash
                         .or_else(|| (block.slot == 0).then_some(pending_blockhash))
                         .unwrap_or([0; 32]);
-                    let idx = usize::try_from(slot_in_epoch(block.slot))
+                    let idx = schedule
+                        .slot_in_epoch(block.slot)
+                        .and_then(|slot| usize::try_from(slot).ok())
                         .context("slot-in-epoch exceeds usize")?;
                     ranges[idx] = SlotRangeWithPreviousBlockhash {
                         range: SlotRange { offset: start, len },
@@ -773,7 +804,7 @@ fn car_header_total_size_from_local_car(path: &Path) -> Result<u64> {
 fn car_header_total_size_from_remote_car(http: &Client, epoch: u64) -> Result<u64> {
     // NOTE: This uses the *plain* .car, because you cannot get the uncompressed CAR header
     // out of a .car.zst with a simple Range request.
-    let url_car = format!("https://files.old-faithful.net/{epoch}/epoch-{epoch}.car");
+    let url_car = remote_car_url(epoch);
 
     eprintln!(
         "epoch={epoch}: range fetch remote CAR prefix ({} bytes): {}",
@@ -783,6 +814,42 @@ fn car_header_total_size_from_remote_car(http: &Client, epoch: u64) -> Result<u6
         .with_context(|| format!("range GET {url_car}"))?;
 
     decode_car_header_total_size(&prefix, &url_car)
+}
+
+fn remote_car_url(epoch: u64) -> String {
+    format!("https://files.old-faithful.net/{epoch}/epoch-{epoch}.car")
+}
+
+/// The epoch's CAR, read from the local file when there is one.
+enum CarReader {
+    Local(LocalFileRangeReader),
+    Remote { http: Client, url: String },
+}
+
+impl RangeReader for CarReader {
+    type ReadFuture<'a>
+        = Ready<Result<()>>
+    where
+        Self: 'a;
+
+    fn read_exact_at<'a>(&'a mut self, offset: u64, out: &'a mut [u8]) -> Self::ReadFuture<'a> {
+        match self {
+            CarReader::Local(reader) => reader.read_exact_at(offset, out),
+            CarReader::Remote { http, url } => ready((|| {
+                let end = offset + out.len() as u64 - 1;
+                let bytes = http_range_get(http, url, offset, end)
+                    .with_context(|| format!("range GET {url}"))?;
+                anyhow::ensure!(
+                    bytes.len() == out.len(),
+                    "{url} range at {offset} returned {} bytes, expected {}",
+                    bytes.len(),
+                    out.len()
+                );
+                out.copy_from_slice(&bytes);
+                Ok(())
+            })()),
+        }
+    }
 }
 
 fn http_range_get(http: &Client, url: &str, start: u64, end: u64) -> Result<Vec<u8>> {

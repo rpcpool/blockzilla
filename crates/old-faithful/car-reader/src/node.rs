@@ -609,8 +609,61 @@ pub fn decode_entry_summary(data: &[u8]) -> crate::node::Result<(u64, &[u8], usi
 
 #[cfg(test)]
 mod tests {
-    use super::{DataFrame, Node, decode_node};
+    use super::{DataFrame, Node, decode_block_metadata, decode_node};
     use minicbor::{Decode, Decoder, Encoder};
+
+    // Block node whose SlotMeta has the Alpenglow tail written by Old Faithful v0.7.30+:
+    // [parent_slot, blocktime, block_height, block_markers, block_id].
+    fn alpenglow_block_node(block_height: Option<u64>) -> Vec<u8> {
+        let mut e = Encoder::new(Vec::new());
+        e.array(6).expect("block");
+        e.u64(2).expect("kind");
+        e.u64(448_940_256).expect("slot");
+        e.array(0).expect("shredding");
+        e.array(0).expect("entries");
+        e.array(5).expect("meta");
+        e.u64(448_940_255).expect("parent_slot");
+        e.i64(1_791_223_953).expect("blocktime");
+        match block_height {
+            Some(height) => e.u64(height).expect("block_height"),
+            None => e.null().expect("block_height"),
+        };
+        e.array(2).expect("block_markers");
+        e.bytes(&[1, 0, 1, 1, 0, 1]).expect("header marker");
+        e.bytes(&[1, 0, 0, 1, 0, 1]).expect("footer marker");
+        e.bytes(&[7; 32]).expect("block_id");
+        e.null().expect("rewards");
+        e.into_writer()
+    }
+
+    #[test]
+    fn block_node_skips_alpenglow_slot_meta_fields() {
+        let payload = alpenglow_block_node(Some(400_525_716));
+
+        let Node::Block(block) = decode_node(&payload).expect("decode block") else {
+            panic!("expected block");
+        };
+        assert_eq!(block.slot, 448_940_256);
+        assert_eq!(block.meta.parent_slot, Some(448_940_255));
+        assert_eq!(block.meta.blocktime, Some(1_791_223_953));
+        assert_eq!(block.meta.block_height, Some(400_525_716));
+        assert!(block.rewards.is_none());
+
+        let (slot, meta) = decode_block_metadata(&payload).expect("decode block metadata");
+        assert_eq!(slot, 448_940_256);
+        assert_eq!(meta, block.meta);
+    }
+
+    #[test]
+    fn block_node_skips_alpenglow_slot_meta_fields_with_null_height() {
+        let payload = alpenglow_block_node(None);
+
+        let Node::Block(block) = decode_node(&payload).expect("decode block") else {
+            panic!("expected block");
+        };
+        assert_eq!(block.meta.block_height, None);
+        assert!(block.rewards.is_none());
+    }
 
     #[test]
     fn dataframe_hash_accepts_signed_cbor_i64() {

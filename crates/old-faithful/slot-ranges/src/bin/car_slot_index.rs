@@ -4,7 +4,7 @@ use of_car_reader::{
     CarBlockReader,
     node::{decode_block_metadata, decode_entry_hash, is_block_node, is_entry_node},
     slot_ranges::{
-        SLOTS_PER_EPOCH, SlotRange, SlotRangeWithPreviousBlockhash, epoch_for_slot, slot_in_epoch,
+        EpochSchedule, SLOTS_PER_EPOCH, SlotRange, SlotRangeWithPreviousBlockhash,
         write_slot_ranges_raw, write_slot_ranges_v2_raw,
     },
 };
@@ -115,6 +115,15 @@ struct Cli {
     /// I/O buffer size per worker.
     #[arg(long, default_value_t = DEFAULT_BUFFER_MIB)]
     buffer_mib: usize,
+
+    /// Cluster whose epoch schedule maps epochs to slots (mainnet, testnet or devnet).
+    #[arg(long, default_value = "mainnet", value_parser = parse_epoch_schedule)]
+    cluster: EpochSchedule,
+}
+
+fn parse_epoch_schedule(cluster: &str) -> Result<EpochSchedule, String> {
+    EpochSchedule::for_cluster(cluster)
+        .ok_or_else(|| format!("unknown cluster {cluster:?} (expected mainnet, testnet or devnet)"))
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +146,7 @@ struct Config {
     require_seed: bool,
     overwrite: bool,
     buffer_bytes: usize,
+    epoch_schedule: EpochSchedule,
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +236,7 @@ fn main() -> Result<()> {
             .buffer_mib
             .checked_mul(1024 * 1024)
             .ok_or_else(|| anyhow!("buffer-mib overflow"))?,
+        epoch_schedule: cli.cluster,
     });
 
     let inputs = discover_inputs(&cli.inputs, &config, cli.start_epoch, cli.end_epoch)?;
@@ -436,6 +447,7 @@ fn build_epoch(input: EpochInput, config: &Config) -> Result<BuildSummary> {
         scan_car_reader(
             decoder,
             input.epoch,
+            config.epoch_schedule,
             previous_blockhash,
             config.buffer_bytes,
             !config.raw_only,
@@ -445,6 +457,7 @@ fn build_epoch(input: EpochInput, config: &Config) -> Result<BuildSummary> {
         scan_car_reader(
             reader,
             input.epoch,
+            config.epoch_schedule,
             previous_blockhash,
             config.buffer_bytes,
             !config.raw_only,
@@ -516,6 +529,7 @@ struct ScanOutput {
 fn scan_car_reader<R: Read>(
     reader: R,
     epoch: u64,
+    schedule: EpochSchedule,
     seed_previous_blockhash: Option<[u8; 32]>,
     buffer_bytes: usize,
     collect_blockhashes: bool,
@@ -604,9 +618,11 @@ fn scan_car_reader<R: Read>(
         let len = u32::try_from(end.saturating_sub(start))
             .with_context(|| format!("slot {slot} CAR range exceeds u32"))?;
 
-        if epoch_for_slot(slot) == epoch {
-            let idx =
-                usize::try_from(slot_in_epoch(slot)).context("slot-in-epoch exceeds usize")?;
+        if schedule.epoch(slot) == Some(epoch) {
+            let idx = schedule
+                .slot_in_epoch(slot)
+                .and_then(|slot| usize::try_from(slot).ok())
+                .context("slot-in-epoch exceeds usize")?;
             if !raw_ranges[idx].is_empty() {
                 return Err(anyhow!("duplicate block for slot {slot}"));
             }

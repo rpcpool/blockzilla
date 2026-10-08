@@ -80,7 +80,10 @@ slot-index/epoch-N-slot-ranges.raw
 
 ## Raw Format
 
-Each row is 12 bytes and is addressed by `slot % 432000`:
+Each row is 12 bytes and is addressed by the slot's offset in its epoch
+(`slot % 432000` on mainnet and devnet). Testnet has warmup epochs, so pass
+`--cluster testnet` to both binaries there; its epochs start at
+`524256 + (epoch - 14) * 432000`.
 
 ```text
 offset:u64_le len:u32_le

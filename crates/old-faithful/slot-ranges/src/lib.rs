@@ -3,7 +3,9 @@ use of_car_reader::compact_index::{
     BUCKET_HEADER_SIZE, CompactIndexHeader, CompactIndexMeta, bst_lookup, bucket_hash,
     decode_offset_and_size, truncate_entry_hash,
 };
-use of_car_reader::slot_ranges::{SLOTS_PER_EPOCH, SlotRange};
+use of_car_reader::node::{Node, decode_node};
+use of_car_reader::slot_ranges::{EpochSchedule, SLOTS_PER_EPOCH, SlotRange};
+use std::collections::HashMap;
 #[cfg(any(not(target_arch = "wasm32"), test))]
 use std::future::{Ready, ready};
 
@@ -13,6 +15,7 @@ pub const DEFAULT_MAX_BUCKET_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 pub struct BuildSlotRangesConfig {
     pub max_bucket_payload_bytes: usize,
     pub allow_node_read_fallback: bool,
+    pub epoch_schedule: EpochSchedule,
 }
 
 impl Default for BuildSlotRangesConfig {
@@ -20,6 +23,7 @@ impl Default for BuildSlotRangesConfig {
         Self {
             max_bucket_payload_bytes: DEFAULT_MAX_BUCKET_PAYLOAD_BYTES,
             allow_node_read_fallback: false,
+            epoch_schedule: EpochSchedule::MAINNET,
         }
     }
 }
@@ -33,6 +37,7 @@ pub struct BuildSlotRangesStats {
     pub max_cid_bucket_payload_bytes: usize,
     pub slot_node_read_fallbacks: u64,
     pub cid_node_read_fallbacks: u64,
+    pub slot_index_false_positives: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -189,16 +194,19 @@ impl<R: RangeReader> AsyncCompactIndex<R> {
     }
 }
 
-pub async fn build_slot_ranges_from_indexes<S, C>(
+/// `car` is only read for the few blocks that more than one slot resolves to.
+pub async fn build_slot_ranges_from_indexes<S, C, K>(
     epoch: u64,
     car_header_size: u64,
     slot_index: &mut AsyncCompactIndex<S>,
     cid_index: &mut AsyncCompactIndex<C>,
+    car: &mut K,
     config: BuildSlotRangesConfig,
 ) -> Result<BuildSlotRangesOutput>
 where
     S: RangeReader,
     C: RangeReader,
+    K: RangeReader,
 {
     if slot_index.version() != 1 || cid_index.version() != 1 {
         return Err(anyhow!(
@@ -214,9 +222,10 @@ where
         ));
     }
 
-    let epoch_start_slot = epoch
-        .checked_mul(SLOTS_PER_EPOCH)
-        .ok_or_else(|| anyhow!("epoch start slot overflow"))?;
+    let epoch_start_slot = config
+        .epoch_schedule
+        .first_slot(epoch)
+        .ok_or_else(|| anyhow!("epoch {epoch} is a warmup epoch or overflows"))?;
     let bitset_len = (SLOTS_PER_EPOCH as usize).div_ceil(8);
     let mut stats = BuildSlotRangesStats::default();
 
@@ -311,6 +320,7 @@ where
     cid_groups.sort_unstable_by_key(|(bucket, slot)| (*bucket, *slot));
 
     let mut slot_has_end = vec![0u8; bitset_len];
+    let mut slot_offset_abs = vec![0u64; SLOTS_PER_EPOCH as usize];
     let mut slot_end_excl_abs = vec![0u64; SLOTS_PER_EPOCH as usize];
 
     let mut group_start = 0usize;
@@ -342,6 +352,7 @@ where
                     &slot_cids[(i as usize) * cid_value_size..(i as usize + 1) * cid_value_size];
                 if cid_index.lookup_into_node_reads(cid, &mut out).await? && out.len() == 9 {
                     let (offset, size) = decode_offset_and_size(&out)?;
+                    slot_offset_abs[i as usize] = offset;
                     slot_end_excl_abs[i as usize] = offset
                         .checked_add(size as u64)
                         .ok_or_else(|| anyhow!("overflow end_excl_abs"))?;
@@ -371,6 +382,7 @@ where
                 ) && value.len() == 9
                 {
                     let (offset, size) = decode_offset_and_size(value)?;
+                    slot_offset_abs[i as usize] = offset;
                     slot_end_excl_abs[i as usize] = offset
                         .checked_add(size as u64)
                         .ok_or_else(|| anyhow!("overflow end_excl_abs"))?;
@@ -380,6 +392,37 @@ where
         }
 
         group_start = group_end;
+    }
+
+    // The slot index stores short key hashes, so a slot without a block can match another
+    // slot's entry and resolve to that block. Keep only the slot each shared block belongs to.
+    let mut slots_by_end: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, &end) in slot_end_excl_abs.iter().enumerate() {
+        if get_bit(&slot_has_end, i) {
+            slots_by_end.entry(end).or_default().push(i);
+        }
+    }
+    for slots in slots_by_end.into_values().filter(|slots| slots.len() > 1) {
+        let i = slots[0];
+        let cid = &slot_cids[i * cid_value_size..(i + 1) * cid_value_size];
+        let block_slot =
+            read_block_slot(car, slot_offset_abs[i], slot_end_excl_abs[i], cid).await?;
+        let owner = block_slot
+            .checked_sub(epoch_start_slot)
+            .and_then(|idx| usize::try_from(idx).ok())
+            .filter(|idx| slots.contains(idx))
+            .ok_or_else(|| {
+                anyhow!(
+                    "block at CAR offset {} is slot {block_slot}, but the slot index maps slots {:?} to it",
+                    slot_offset_abs[i],
+                    slots.iter().map(|&s| epoch_start_slot + s as u64).collect::<Vec<_>>()
+                )
+            })?;
+        for &s in slots.iter().filter(|&&s| s != owner) {
+            clear_bit(&mut slot_has_end, s);
+            stats.slot_index_false_positives += 1;
+            stats.present_slots -= 1;
+        }
     }
 
     let mut ranges = vec![SlotRange::EMPTY; SLOTS_PER_EPOCH as usize];
@@ -392,14 +435,19 @@ where
         let cur_end_excl_abs = slot_end_excl_abs[i];
         let start_abs = prev_end_excl_abs.unwrap_or(car_header_size);
 
-        if cur_end_excl_abs > start_abs {
-            let len64 = cur_end_excl_abs - start_abs;
-            if len64 <= u32::MAX as u64 {
-                ranges[i] = SlotRange {
-                    offset: start_abs,
-                    len: len64 as u32,
-                };
-            }
+        // Blocks are written in slot order, so an end at or before the previous one is a bad lookup.
+        if cur_end_excl_abs <= start_abs {
+            return Err(anyhow!(
+                "slot {} ends at CAR offset {cur_end_excl_abs}, not after the previous block's end {start_abs}",
+                epoch_start_slot + i as u64
+            ));
+        }
+        let len64 = cur_end_excl_abs - start_abs;
+        if len64 <= u32::MAX as u64 {
+            ranges[i] = SlotRange {
+                offset: start_abs,
+                len: len64 as u32,
+            };
         }
 
         prev_end_excl_abs = Some(cur_end_excl_abs);
@@ -444,6 +492,11 @@ fn set_bit(bitset: &mut [u8], index: usize) {
 }
 
 #[inline(always)]
+fn clear_bit(bitset: &mut [u8], index: usize) {
+    bitset[index / 8] &= !(1 << (index % 8));
+}
+
+#[inline(always)]
 fn get_bit(bitset: &[u8], index: usize) -> bool {
     (bitset[index / 8] & (1 << (index % 8))) != 0
 }
@@ -455,6 +508,30 @@ fn read_hash(bytes: &[u8]) -> u64 {
         value |= (*byte as u64) << (index * 8);
     }
     value
+}
+
+/// Reads the slot of the block node stored in the CAR section `[offset, end)`.
+async fn read_block_slot<K: RangeReader>(
+    car: &mut K,
+    offset: u64,
+    end: u64,
+    cid: &[u8],
+) -> Result<u64> {
+    let len = usize::try_from(end - offset).map_err(|_| anyhow!("CAR section too large"))?;
+    let mut section = vec![0u8; len];
+    car.read_exact_at(offset, &mut section).await?;
+    let (_, varint_len) = decode_uvarint64(&section)
+        .ok_or_else(|| anyhow!("bad CAR section length at offset {offset}"))?;
+    let payload = section[varint_len..].strip_prefix(cid).ok_or_else(|| {
+        anyhow!("CAR section at offset {offset} does not start with the indexed CID")
+    })?;
+    match decode_node(payload) {
+        Ok(Node::Block(block)) => Ok(block.slot),
+        Ok(_) => Err(anyhow!(
+            "CAR section at offset {offset} is not a block node"
+        )),
+        Err(err) => Err(anyhow!("decode block node at offset {offset}: {err}")),
+    }
 }
 
 #[inline]
@@ -535,6 +612,170 @@ mod tests {
             *max_read.borrow(),
             of_car_reader::compact_index::COMPACT_INDEX_FIXED_HEADER_SIZE
         );
+    }
+
+    #[test]
+    fn slot_index_false_positives_keep_the_block_on_its_own_slot() {
+        // 1-byte slot hashes, so hundreds of block-less slots match one of the two blocks.
+        let slot_hash_len = 1;
+        let first_slot = EpochSchedule::MAINNET.first_slot(1).unwrap();
+        let slot_hash = |slot: u64| truncate_entry_hash(11, &slot.to_le_bytes(), slot_hash_len);
+        let block1 = first_slot + 1000;
+        let block2 = (first_slot + 2000..)
+            .find(|&slot| slot_hash(slot) != slot_hash(block1))
+            .unwrap();
+        // The case that used to blank out real blocks: a block-less slot before block1 resolves to block2.
+        let early = (first_slot..block1)
+            .find(|&slot| slot_hash(slot) == slot_hash(block2))
+            .unwrap();
+        let (cid1, cid2) = (vec![1u8; 36], vec![2u8; 36]);
+
+        let header_size = 10u64;
+        let mut car = vec![0u8; header_size as usize];
+        let mut offsets_and_sizes = Vec::new();
+        for (slot, cid) in [(block1, &cid1), (block2, &cid2)] {
+            // Some entry bytes before the block node, as in a real CAR.
+            car.extend_from_slice(&[0xee; 50]);
+            let offset = car.len() as u64;
+            car.extend_from_slice(&car_section(cid, &block_node(slot)));
+            let size = car.len() as u64 - offset;
+            let mut value = offset.to_le_bytes()[..6].to_vec();
+            value.extend_from_slice(&(size as u32).to_le_bytes()[..3]);
+            offsets_and_sizes.push((offset, size, value));
+        }
+
+        let memory = |bytes| MemoryRangeReader {
+            bytes,
+            max_read: Rc::new(RefCell::new(0)),
+        };
+        let slot_index_bytes = compact_index(
+            slot_hash_len as u8,
+            &[
+                (block1.to_le_bytes().to_vec(), cid1.clone()),
+                (block2.to_le_bytes().to_vec(), cid2.clone()),
+            ],
+        );
+        let cid_index_bytes = compact_index(
+            8,
+            &[
+                (cid1, offsets_and_sizes[0].2.clone()),
+                (cid2, offsets_and_sizes[1].2.clone()),
+            ],
+        );
+        let mut slot_index =
+            futures::executor::block_on(AsyncCompactIndex::open(memory(slot_index_bytes), "slot"))
+                .unwrap();
+        let mut cid_index =
+            futures::executor::block_on(AsyncCompactIndex::open(memory(cid_index_bytes), "cid"))
+                .unwrap();
+
+        let output = futures::executor::block_on(build_slot_ranges_from_indexes(
+            1,
+            header_size,
+            &mut slot_index,
+            &mut cid_index,
+            &mut memory(car),
+            BuildSlotRangesConfig::default(),
+        ))
+        .unwrap();
+
+        let ranged: Vec<_> = output
+            .ranges
+            .iter()
+            .enumerate()
+            .filter(|(_, range)| !range.is_empty())
+            .map(|(i, range)| (first_slot + i as u64, *range))
+            .collect();
+        let end1 = offsets_and_sizes[0].0 + offsets_and_sizes[0].1;
+        let end2 = offsets_and_sizes[1].0 + offsets_and_sizes[1].1;
+        assert_eq!(
+            ranged,
+            vec![
+                (
+                    block1,
+                    SlotRange {
+                        offset: header_size,
+                        len: (end1 - header_size) as u32
+                    }
+                ),
+                (
+                    block2,
+                    SlotRange {
+                        offset: end1,
+                        len: (end2 - end1) as u32
+                    }
+                ),
+            ]
+        );
+        assert!(early < block1);
+        assert!(output.stats.slot_index_false_positives > 100);
+        assert_eq!(output.stats.present_slots, 2);
+    }
+
+    // Block node with a legacy SlotMeta [parent_slot, blocktime, block_height] and no rewards.
+    fn block_node(slot: u64) -> Vec<u8> {
+        let mut out = vec![0x86, 0x02, 0x1b];
+        out.extend_from_slice(&slot.to_be_bytes());
+        out.extend_from_slice(&[0x80, 0x80, 0x83, 0x1b]);
+        out.extend_from_slice(&(slot - 1).to_be_bytes());
+        out.extend_from_slice(&[0x00, 0x00, 0xf6]);
+        out
+    }
+
+    fn car_section(cid: &[u8], payload: &[u8]) -> Vec<u8> {
+        let len = cid.len() + payload.len();
+        assert!(len < 0x80, "test sections use a one-byte length");
+        let mut out = vec![len as u8];
+        out.extend_from_slice(cid);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    // Single-bucket compact index with its entries in the Eytzinger order bst_lookup walks.
+    fn compact_index(hash_len: u8, entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+        let hash_domain = 11u32;
+        let mut hashed: Vec<_> = entries
+            .iter()
+            .map(|(key, value)| {
+                (
+                    truncate_entry_hash(hash_domain, key, hash_len as usize),
+                    value,
+                )
+            })
+            .collect();
+        hashed.sort_by_key(|(hash, _)| *hash);
+        let mut order = vec![0usize; hashed.len()];
+        fn eytzinger(order: &mut [usize], next: &mut usize, k: usize) {
+            if k <= order.len() {
+                eytzinger(order, next, 2 * k);
+                order[k - 1] = *next;
+                *next += 1;
+                eytzinger(order, next, 2 * k + 1);
+            }
+        }
+        eytzinger(&mut order, &mut 0, 1);
+
+        let fixed_len = of_car_reader::compact_index::COMPACT_INDEX_FIXED_HEADER_SIZE;
+        let mut out = Vec::new();
+        out.extend_from_slice(of_car_reader::compact_index::COMPACT_INDEX_MAGIC);
+        out.extend_from_slice(&13u32.to_le_bytes());
+        out.extend_from_slice(&(hashed[0].1.len() as u64).to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.push(1);
+
+        let mut bucket_header = [0u8; BUCKET_HEADER_SIZE];
+        bucket_header[0..4].copy_from_slice(&hash_domain.to_le_bytes());
+        bucket_header[4..8].copy_from_slice(&(hashed.len() as u32).to_le_bytes());
+        bucket_header[8] = hash_len;
+        bucket_header[10..16]
+            .copy_from_slice(&((fixed_len + BUCKET_HEADER_SIZE) as u64).to_le_bytes()[..6]);
+        out.extend_from_slice(&bucket_header);
+        for &i in &order {
+            let (hash, value) = hashed[i];
+            out.extend_from_slice(&hash.to_le_bytes()[..hash_len as usize]);
+            out.extend_from_slice(value);
+        }
+        out
     }
 
     fn tiny_compact_index(key: &[u8], value: &[u8]) -> Vec<u8> {
