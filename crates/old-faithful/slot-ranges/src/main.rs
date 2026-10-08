@@ -4,8 +4,8 @@ use of_car_reader::{
     CarBlockReader,
     node::{Node, decode_node},
     slot_ranges::{
-        SLOT_RANGE_ENTRY_SIZE, SLOTS_PER_EPOCH, SlotRange, SlotRangeWithPreviousBlockhash,
-        decode_slot_range_entry, epoch_for_slot, slot_in_epoch,
+        EpochSchedule, SLOT_RANGE_ENTRY_SIZE, SLOTS_PER_EPOCH, SlotRange,
+        SlotRangeWithPreviousBlockhash, decode_slot_range_entry,
         write_slot_ranges_raw as write_slot_ranges_raw_entries,
         write_slot_ranges_v2_raw as write_slot_ranges_v2_raw_entries,
     },
@@ -76,6 +76,15 @@ struct Cli {
     /// is provided only to decode the CAR header length.
     #[arg(long)]
     raw_only: bool,
+
+    /// Cluster whose epoch schedule maps epochs to slots (mainnet, testnet or devnet).
+    #[arg(long, default_value = "mainnet", value_parser = parse_epoch_schedule)]
+    cluster: EpochSchedule,
+}
+
+fn parse_epoch_schedule(cluster: &str) -> Result<EpochSchedule, String> {
+    EpochSchedule::for_cluster(cluster)
+        .ok_or_else(|| format!("unknown cluster {cluster:?} (expected mainnet, testnet or devnet)"))
 }
 
 fn main() -> Result<()> {
@@ -163,6 +172,7 @@ fn main() -> Result<()> {
                 BuildSlotRangesConfig {
                     max_bucket_payload_bytes: MAX_BUCKET_SIZE,
                     allow_node_read_fallback: true,
+                    epoch_schedule: cli.cluster,
                 },
             ))?;
             eprintln!(
@@ -217,6 +227,7 @@ fn main() -> Result<()> {
             let v2 = build_slot_ranges_v2_from_archive_v2_sidecars(
                 &epoch_dir,
                 epoch,
+                cli.cluster,
                 &raw_ranges,
                 initial_previous_blockhash,
             )?;
@@ -231,6 +242,7 @@ fn main() -> Result<()> {
             let v2 = build_slot_ranges_v2_from_local_car(
                 &local_car_path,
                 epoch,
+                cli.cluster,
                 previous_epoch_last_blockhash,
             )?;
             previous_epoch_last_blockhash = v2.last_blockhash;
@@ -318,6 +330,7 @@ struct ArchiveV2BlockIndexRow {
 fn build_slot_ranges_v2_from_archive_v2_sidecars(
     epoch_dir: &Path,
     epoch: u64,
+    schedule: EpochSchedule,
     raw_ranges: &[SlotRange],
     initial_previous_blockhash: Option<[u8; 32]>,
 ) -> Result<SlotRangesV2Build> {
@@ -330,6 +343,7 @@ fn build_slot_ranges_v2_from_archive_v2_sidecars(
         return build_slot_ranges_v2_from_blockhash_registry_sidecar(
             epoch_dir,
             epoch,
+            schedule,
             raw_ranges,
             initial_previous_blockhash,
         );
@@ -349,7 +363,7 @@ fn build_slot_ranges_v2_from_archive_v2_sidecars(
     let mut present_slots = 0u64;
 
     for row in rows {
-        if epoch_for_slot(row.slot) != epoch {
+        if schedule.epoch(row.slot) != Some(epoch) {
             continue;
         }
         let hash_index = row
@@ -365,8 +379,10 @@ fn build_slot_ranges_v2_from_archive_v2_sidecars(
             )
         })?;
 
-        let idx =
-            usize::try_from(slot_in_epoch(row.slot)).context("slot-in-epoch exceeds usize")?;
+        let idx = schedule
+            .slot_in_epoch(row.slot)
+            .and_then(|slot| usize::try_from(slot).ok())
+            .context("slot-in-epoch exceeds usize")?;
         let range = raw_ranges[idx];
         if range.is_empty() {
             eprintln!(
@@ -399,6 +415,7 @@ fn build_slot_ranges_v2_from_archive_v2_sidecars(
 fn build_slot_ranges_v2_from_blockhash_registry_sidecar(
     epoch_dir: &Path,
     epoch: u64,
+    schedule: EpochSchedule,
     raw_ranges: &[SlotRange],
     initial_previous_blockhash: Option<[u8; 32]>,
 ) -> Result<SlotRangesV2Build> {
@@ -417,9 +434,9 @@ fn build_slot_ranges_v2_from_blockhash_registry_sidecar(
     let mut previous_blockhash = initial_previous_blockhash.or(genesis_previous_blockhash);
     let mut last_blockhash = None;
     let mut block_i = 0usize;
-    let epoch_start = epoch
-        .checked_mul(SLOTS_PER_EPOCH)
-        .ok_or_else(|| anyhow!("epoch start slot overflow for epoch {epoch}"))?;
+    let epoch_start = schedule
+        .first_slot(epoch)
+        .ok_or_else(|| anyhow!("epoch {epoch} is a warmup epoch or overflows"))?;
 
     for (slot_in_epoch, range) in raw_ranges.iter().copied().enumerate() {
         if range.is_empty() {
@@ -654,6 +671,7 @@ fn find_archive_v2_blockhash_dir(
 fn build_slot_ranges_v2_from_local_car(
     path: &Path,
     epoch: u64,
+    schedule: EpochSchedule,
     initial_previous_blockhash: Option<[u8; 32]>,
 ) -> Result<SlotRangesV2Build> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -701,13 +719,15 @@ fn build_slot_ranges_v2_from_local_car(
                     .checked_add(entry.total_len as u64)
                     .ok_or_else(|| anyhow!("CAR range end overflow"))?;
 
-                if epoch_for_slot(block.slot) == epoch {
+                if schedule.epoch(block.slot) == Some(epoch) {
                     let len = u32::try_from(end.saturating_sub(start))
                         .context("CAR block range exceeds u32")?;
                     let previous = previous_blockhash
                         .or_else(|| (block.slot == 0).then_some(pending_blockhash))
                         .unwrap_or([0; 32]);
-                    let idx = usize::try_from(slot_in_epoch(block.slot))
+                    let idx = schedule
+                        .slot_in_epoch(block.slot)
+                        .and_then(|slot| usize::try_from(slot).ok())
                         .context("slot-in-epoch exceeds usize")?;
                     ranges[idx] = SlotRangeWithPreviousBlockhash {
                         range: SlotRange { offset: start, len },

@@ -1,2 +1,4 @@
-[target.'cfg(not(target_arch = "wasm32"))']
-rustflags = ["-C", "target-cpu=native"]
+# Release binaries must run on every warehouse host (Zen 3 and Zen 4), so pin a
+# portable x86-64 level instead of the build machine's CPU.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

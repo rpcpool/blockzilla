@@ -82,6 +82,64 @@ impl fmt::Display for SlotRangeError {
 
 impl std::error::Error for SlotRangeError {}
 
+/// Cluster epoch schedule. Testnet starts with warmup epochs, so its epoch
+/// boundaries are offset from `epoch * SLOTS_PER_EPOCH`; mainnet and devnet are not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EpochSchedule {
+    pub first_normal_epoch: u64,
+    pub first_normal_slot: u64,
+}
+
+impl EpochSchedule {
+    pub const MAINNET: Self = Self {
+        first_normal_epoch: 0,
+        first_normal_slot: 0,
+    };
+    pub const DEVNET: Self = Self::MAINNET;
+    pub const TESTNET: Self = Self {
+        first_normal_epoch: 14,
+        first_normal_slot: 524_256,
+    };
+
+    pub fn for_cluster(cluster: &str) -> Option<Self> {
+        match cluster {
+            "mainnet" | "mainnet-beta" => Some(Self::MAINNET),
+            "testnet" => Some(Self::TESTNET),
+            "devnet" => Some(Self::DEVNET),
+            _ => None,
+        }
+    }
+
+    /// First slot of `epoch`, or `None` for a warmup epoch (shorter than `SLOTS_PER_EPOCH`).
+    #[inline]
+    pub fn first_slot(self, epoch: u64) -> Option<u64> {
+        epoch
+            .checked_sub(self.first_normal_epoch)?
+            .checked_mul(SLOTS_PER_EPOCH)?
+            .checked_add(self.first_normal_slot)
+    }
+
+    /// Epoch of `slot`, or `None` for a slot inside the warmup epochs.
+    #[inline]
+    pub fn epoch(self, slot: u64) -> Option<u64> {
+        let normal = slot.checked_sub(self.first_normal_slot)?;
+        Some(normal / SLOTS_PER_EPOCH + self.first_normal_epoch)
+    }
+
+    /// Row of `slot` in its epoch's slot range file, or `None` inside the warmup epochs.
+    #[inline]
+    pub fn slot_in_epoch(self, slot: u64) -> Option<u64> {
+        let normal = slot.checked_sub(self.first_normal_slot)?;
+        Some(normal % SLOTS_PER_EPOCH)
+    }
+}
+
+impl Default for EpochSchedule {
+    fn default() -> Self {
+        Self::MAINNET
+    }
+}
+
 #[inline]
 pub fn epoch_for_slot(slot: u64) -> u64 {
     slot / SLOTS_PER_EPOCH
@@ -195,5 +253,28 @@ mod tests {
         assert_eq!(slot_range_v2_entry_offset(42).unwrap(), 42 * 44);
         assert!(slot_range_entry_offset(SLOTS_PER_EPOCH).is_err());
         assert!(slot_range_v2_entry_offset(SLOTS_PER_EPOCH).is_err());
+    }
+
+    #[test]
+    fn mainnet_schedule_matches_fixed_epoch_math() {
+        let schedule = EpochSchedule::MAINNET;
+        assert_eq!(schedule.first_slot(1049), Some(1049 * SLOTS_PER_EPOCH));
+        for slot in [0, 431_999, 432_000, 453_168_000, 453_599_999] {
+            assert_eq!(schedule.epoch(slot), Some(epoch_for_slot(slot)));
+            assert_eq!(schedule.slot_in_epoch(slot), Some(slot_in_epoch(slot)));
+        }
+    }
+
+    #[test]
+    fn testnet_schedule_skips_warmup_epochs() {
+        // Testnet epoch 1052 (Alpenglow) starts at 448,940,256, per getEpochSchedule.
+        let schedule = EpochSchedule::TESTNET;
+        assert_eq!(schedule.first_slot(1052), Some(448_940_256));
+        assert_eq!(schedule.epoch(448_940_256), Some(1052));
+        assert_eq!(schedule.epoch(448_940_255), Some(1051));
+        assert_eq!(schedule.slot_in_epoch(448_940_256), Some(0));
+        assert_eq!(schedule.slot_in_epoch(448_942_255), Some(1_999));
+        assert_eq!(schedule.first_slot(13), None);
+        assert_eq!(schedule.epoch(524_255), None);
     }
 }

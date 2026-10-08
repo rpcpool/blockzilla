@@ -3,7 +3,7 @@ use of_car_reader::compact_index::{
     BUCKET_HEADER_SIZE, CompactIndexHeader, CompactIndexMeta, bst_lookup, bucket_hash,
     decode_offset_and_size, truncate_entry_hash,
 };
-use of_car_reader::slot_ranges::{SLOTS_PER_EPOCH, SlotRange};
+use of_car_reader::slot_ranges::{EpochSchedule, SLOTS_PER_EPOCH, SlotRange};
 #[cfg(any(not(target_arch = "wasm32"), test))]
 use std::future::{Ready, ready};
 
@@ -13,6 +13,7 @@ pub const DEFAULT_MAX_BUCKET_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 pub struct BuildSlotRangesConfig {
     pub max_bucket_payload_bytes: usize,
     pub allow_node_read_fallback: bool,
+    pub epoch_schedule: EpochSchedule,
 }
 
 impl Default for BuildSlotRangesConfig {
@@ -20,6 +21,7 @@ impl Default for BuildSlotRangesConfig {
         Self {
             max_bucket_payload_bytes: DEFAULT_MAX_BUCKET_PAYLOAD_BYTES,
             allow_node_read_fallback: false,
+            epoch_schedule: EpochSchedule::MAINNET,
         }
     }
 }
@@ -214,9 +216,10 @@ where
         ));
     }
 
-    let epoch_start_slot = epoch
-        .checked_mul(SLOTS_PER_EPOCH)
-        .ok_or_else(|| anyhow!("epoch start slot overflow"))?;
+    let epoch_start_slot = config
+        .epoch_schedule
+        .first_slot(epoch)
+        .ok_or_else(|| anyhow!("epoch {epoch} is a warmup epoch or overflows"))?;
     let bitset_len = (SLOTS_PER_EPOCH as usize).div_ceil(8);
     let mut stats = BuildSlotRangesStats::default();
 
