@@ -11,13 +11,14 @@ use of_car_reader::{
     },
 };
 use of_slot_ranges::{
-    AsyncCompactIndex, BuildSlotRangesConfig, LocalFileRangeReader, build_slot_ranges_from_indexes,
-    decode_car_header_total_size,
+    AsyncCompactIndex, BuildSlotRangesConfig, LocalFileRangeReader, RangeReader,
+    build_slot_ranges_from_indexes, decode_car_header_total_size,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, RANGE};
 use std::fs;
 use std::fs::File;
+use std::future::{Ready, ready};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -163,12 +164,21 @@ fn main() -> Result<()> {
             let car_hdr = car_header_total_size(&http, epoch, cli.cars_dir.as_deref())?;
             eprintln!("epoch={epoch}: car_header_size={car_hdr}");
 
+            let mut car = match find_local_car(epoch, cli.cars_dir.as_deref()) {
+                Some(path) => CarReader::Local(LocalFileRangeReader::open(&path)?),
+                None => CarReader::Remote {
+                    http: http.clone(),
+                    url: remote_car_url(epoch),
+                },
+            };
+
             let t0 = std::time::Instant::now();
             let output = futures::executor::block_on(build_slot_ranges_from_indexes(
                 epoch,
                 car_hdr,
                 &mut slot_index,
                 &mut cid_index,
+                &mut car,
                 BuildSlotRangesConfig {
                     max_bucket_payload_bytes: MAX_BUCKET_SIZE,
                     allow_node_read_fallback: true,
@@ -176,7 +186,7 @@ fn main() -> Result<()> {
                 },
             ))?;
             eprintln!(
-                "epoch={epoch}: done build ranges in {:.2}s present_slots={} slot_bucket_read={} MiB cid_bucket_read={} MiB max_slot_bucket={} MiB max_cid_bucket={} MiB slot_node_fallbacks={} cid_node_fallbacks={}",
+                "epoch={epoch}: done build ranges in {:.2}s present_slots={} slot_bucket_read={} MiB cid_bucket_read={} MiB max_slot_bucket={} MiB max_cid_bucket={} MiB slot_node_fallbacks={} cid_node_fallbacks={} slot_index_false_positives={}",
                 t0.elapsed().as_secs_f64(),
                 output.stats.present_slots,
                 output.stats.slot_bucket_payload_bytes_read / (1024 * 1024),
@@ -185,6 +195,7 @@ fn main() -> Result<()> {
                 output.stats.max_cid_bucket_payload_bytes / (1024 * 1024),
                 output.stats.slot_node_read_fallbacks,
                 output.stats.cid_node_read_fallbacks,
+                output.stats.slot_index_false_positives,
             );
 
             eprintln!("epoch={epoch}: write {}", out_path.display());
@@ -793,7 +804,7 @@ fn car_header_total_size_from_local_car(path: &Path) -> Result<u64> {
 fn car_header_total_size_from_remote_car(http: &Client, epoch: u64) -> Result<u64> {
     // NOTE: This uses the *plain* .car, because you cannot get the uncompressed CAR header
     // out of a .car.zst with a simple Range request.
-    let url_car = format!("https://files.old-faithful.net/{epoch}/epoch-{epoch}.car");
+    let url_car = remote_car_url(epoch);
 
     eprintln!(
         "epoch={epoch}: range fetch remote CAR prefix ({} bytes): {}",
@@ -803,6 +814,42 @@ fn car_header_total_size_from_remote_car(http: &Client, epoch: u64) -> Result<u6
         .with_context(|| format!("range GET {url_car}"))?;
 
     decode_car_header_total_size(&prefix, &url_car)
+}
+
+fn remote_car_url(epoch: u64) -> String {
+    format!("https://files.old-faithful.net/{epoch}/epoch-{epoch}.car")
+}
+
+/// The epoch's CAR, read from the local file when there is one.
+enum CarReader {
+    Local(LocalFileRangeReader),
+    Remote { http: Client, url: String },
+}
+
+impl RangeReader for CarReader {
+    type ReadFuture<'a>
+        = Ready<Result<()>>
+    where
+        Self: 'a;
+
+    fn read_exact_at<'a>(&'a mut self, offset: u64, out: &'a mut [u8]) -> Self::ReadFuture<'a> {
+        match self {
+            CarReader::Local(reader) => reader.read_exact_at(offset, out),
+            CarReader::Remote { http, url } => ready((|| {
+                let end = offset + out.len() as u64 - 1;
+                let bytes = http_range_get(http, url, offset, end)
+                    .with_context(|| format!("range GET {url}"))?;
+                anyhow::ensure!(
+                    bytes.len() == out.len(),
+                    "{url} range at {offset} returned {} bytes, expected {}",
+                    bytes.len(),
+                    out.len()
+                );
+                out.copy_from_slice(&bytes);
+                Ok(())
+            })()),
+        }
+    }
 }
 
 fn http_range_get(http: &Client, url: &str, start: u64, end: u64) -> Result<Vec<u8>> {
