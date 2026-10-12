@@ -7363,6 +7363,7 @@ mod tests {
                     hash: vec![0; 32],
                     executed_transaction_count: 0,
                     starting_transaction_index: 0,
+                    bank_id: 0,
                 },
                 SubscribeUpdateEntry {
                     slot,
@@ -7371,6 +7372,7 @@ mod tests {
                     hash: vec![0x11; 32],
                     executed_transaction_count: 0,
                     starting_transaction_index: 0,
+                    bank_id: 0,
                 },
             ],
             ..Default::default()
