@@ -176,6 +176,7 @@
 
 #[cfg(feature = "archive")]
 pub mod archive;
+pub mod block_marker;
 pub mod car_block_group;
 pub mod car_stream;
 #[cfg(feature = "compact-index")]

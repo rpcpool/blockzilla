@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- Add `SlotMeta::block_markers` and `SlotMeta::block_id` (Old Faithful
+  v0.7.30 `SlotMeta` indexes 3 and 4) for Alpenglow blocks. Pre-Alpenglow
+  blocks still decode and encode as three-element tuples.
+
+### Added
+
+- Add the `block_marker` module: parse Alpenglow header, footer,
+  update-parent and genesis-certificate markers, keep unknown marker versions
+  as raw bytes, and check a block's marker layout.
+- Add `SlotMeta::parsed_block_markers` and `SlotMeta::block_footer`.
+- Add the `DeactivatedStake` and `VATDebit` reward types.
+
 ## 0.2.0 - 2026-08-26
 
 ### Breaking changes

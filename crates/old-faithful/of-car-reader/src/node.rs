@@ -4,6 +4,8 @@ use minicbor::decode::Error as CborError;
 use minicbor::{Decode, Decoder, Encode};
 use serde::{Deserialize, Serialize};
 
+use crate::block_marker::{self, BlockFooter, BlockMarker, BlockMarkerError};
+
 pub type Result<T> = core::result::Result<T, NodeDecodeError>;
 pub type CarCid = [u8; 36];
 
@@ -190,6 +192,8 @@ impl<'a> From<&DataFrame<'a>> for OwnedDataFrame {
     }
 }
 
+/// Block metadata. Old Faithful writes the shortest tuple, so pre-Alpenglow blocks
+/// have three elements and Alpenglow blocks add `block_markers` and `block_id`.
 #[derive(Debug, Decode, Encode, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cbor(array)]
 pub struct SlotMeta {
@@ -199,6 +203,84 @@ pub struct SlotMeta {
     pub blocktime: Option<i64>,
     #[n(2)]
     pub block_height: Option<u64>,
+    /// Raw Alpenglow block markers in block order; parse with [`crate::block_marker`].
+    #[cbor(n(3), with = "byte_strings", has_nil)]
+    pub block_markers: Option<Vec<Vec<u8>>>,
+    /// Alpenglow block id (double merkle root) that certificates vote on.
+    #[cbor(n(4), with = "minicbor::bytes")]
+    pub block_id: Option<[u8; 32]>,
+}
+
+impl SlotMeta {
+    pub fn parsed_block_markers(
+        &self,
+    ) -> impl Iterator<Item = core::result::Result<BlockMarker<'_>, BlockMarkerError>> {
+        self.block_markers
+            .iter()
+            .flatten()
+            .map(|raw| block_marker::parse(raw))
+    }
+
+    /// The block's footer, or `None` for a block without one (before Alpenglow).
+    pub fn block_footer(&self) -> core::result::Result<Option<BlockFooter<'_>>, BlockMarkerError> {
+        for marker in self.parsed_block_markers() {
+            if let BlockMarker::Footer(footer) = marker? {
+                return Ok(Some(footer));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// CBOR `[bytes]` or null for `Option<Vec<Vec<u8>>>`.
+mod byte_strings {
+    use minicbor::data::Type;
+    use minicbor::{Decoder, Encoder};
+
+    pub fn encode<Ctx, W: minicbor::encode::Write>(
+        value: &Option<Vec<Vec<u8>>>,
+        e: &mut Encoder<W>,
+        _ctx: &mut Ctx,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        match value {
+            None => {
+                e.null()?;
+            }
+            Some(items) => {
+                e.array(items.len() as u64)?;
+                for item in items {
+                    e.bytes(item)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn decode<Ctx>(
+        d: &mut Decoder<'_>,
+        _ctx: &mut Ctx,
+    ) -> Result<Option<Vec<Vec<u8>>>, minicbor::decode::Error> {
+        if d.datatype()? == Type::Null {
+            d.null()?;
+            return Ok(None);
+        }
+        let len = d
+            .array()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite block_markers array"))?;
+        let mut items = Vec::with_capacity(len.min(8) as usize);
+        for _ in 0..len {
+            items.push(d.bytes()?.to_vec());
+        }
+        Ok(Some(items))
+    }
+
+    pub fn nil() -> Option<Option<Vec<Vec<u8>>>> {
+        Some(None)
+    }
+
+    pub fn is_nil(value: &Option<Vec<Vec<u8>>>) -> bool {
+        value.is_none()
+    }
 }
 
 #[derive(Debug, Decode, Encode, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -633,8 +715,141 @@ pub fn decode_entry_summary(data: &[u8]) -> crate::node::Result<(u64, &[u8], usi
 
 #[cfg(test)]
 mod tests {
-    use super::{DataFrame, Node, decode_node};
+    use super::{DataFrame, Node, SlotMeta, decode_block_metadata, decode_node};
+    use crate::block_marker::{self, BlockMarker, ParentRef};
     use minicbor::{Decode, Decoder, Encoder};
+
+    // SlotMeta CBOR of real CAR blocks (radiance v0.0.31-rc.3): testnet slots 448940256
+    // and 448940257 (Alpenglow, header + footer markers) and mainnet slot 453168000.
+    const TESTNET_448940256: &str = "851a1ac248df1a6ac3e8911a17df899482582e010001290001df48c21a00000000bac494bc36eb254155a7697313529be54f481a939789d3b45eef1f59b92528c75902390100003402017194310ec1e664fb8cbcdbc8a0f248ab38feff9fed499588df1535f900a4f0eb2f484a1cb2b4db180001df48c21a00000000bac494bc36eb254155a7697313529be54f481a939789d3b45eef1f59b92528c7ace9e16141d85ac968a6ea594c7f37c02e7977d75e40e902fe20889110b51db390ae7df00cc85662c9ec811b472a6d09152b17e45720cea29165618e3f4bbfa3f2284ba7a0213eaff3b4823435c4390ba0f84a2f06edb28f7799618f6c746afd3e0000d601fdff7befbfdf7a4af7feef65895ddbffb9db86cfefffe93faec6f5c59fbbf7867d8bf7edf776ffbfe3fedf7fdffddffffb6f9ff7ddeb3fc30faf200001d848c21a00000000a89381940a6a07978e3d4be5dadaa61866fd560bd1e9945a06c644f469d0bea076352b813618d9a90d6fbf044b31259812174f0c3a3dada90c264657bb090c3cda403d2d120a845fb447232302399584913ec48eceb2bebef9d2366b0d0b4d5d0e005500000000000000000000001001d848c21a00000000e7b4bc491a3a4c428d7a77d180cdf6df7b0e4a949dfd47865590d9cda65a0868a2f2d6c8e5ddd0b72616480866add2acce4b2eb4e5fa1fd16dbee4d9a178d4e4bf1ee27005116e9e1a7db9ae371595080b883ae5744adcd61ed19ab15f2b1c22a57e9c08efaea6620733805c338eacabd2d654c69cc1370808d8aeedca09fc3f3e00d601fffffbefffdffeffffffefffcfdfffffffffffffffffffffffdffff5ffffffffffffffffffffffffffffffffffffdffffffffffffffbfff3bfef37582090bab6dca987c34e352e0206672cabee5ef1ce559d1799337e8498774c85fe4d";
+    const TESTNET_448940257: &str = "851a1ac248e01a6ac3e8921a17df899582582e010001290001e048c21a0000000090bab6dca987c34e352e0206672cabee5ef1ce559d1799337e8498774c85fe4d590238010000330201046c6a473d2af0392ebc458af98f48c2410840a2a284c5380ff47a5b5b8c58ed73a2b125b2b4db180001e048c21a0000000090bab6dca987c34e352e0206672cabee5ef1ce559d1799337e8498774c85fe4d93e7bd265bbab21ffa0d3af71d7213194df275cbdafa4c98a6dcbe3e8b854d2c25053b01f1d25d79f209489882eee7df11456be62b32ac7adff9ccee5f884def2d5a40fa1a2e63164a5f8b6610f16475c4608773711d968cec80c6eaf426d5ce3d0000cf01f7ef7be59fde7a8a7bffbf19d16aff737fdb70fdfd7f9a8fa6d9bffabefb5b58bfea7effdbf65fcff2ffd47ffdbf7fbb5efbdecbcddddb8019540001d948c21a00000000a40e14ee8ec965306a5487cafdac9e4ad5ccc5459ea4c0f84440234a27acff54b54bda9eb7796270ede8c5810146ed18088166ee3d754af04546adc58fe8312ee953fbc41fa6c31d3fdff39ad91d498a2e3f6646b97d0deac342f6a4994f4c560e005500000000000000000000001001d948c21a00000000df797ebc81eeed1f272210f279f1ad8fdafcc6e5a047d21d742a607da159790e97655a8e9a8605766d21f7da3b7db1dda8ab94582c5c1381a51c65b1303b431161ee89849eec7bfbfce479d366b3aea2127f8059d433bdee6f4449ffe857eb43d466294bfc5bfa5f6c434409d1f4fc0d21a3fddfd41e894d4026530aba775e2f3e00d601fffffbefffdffeffffffefffcfdfffffffffffffffffffffffdffff5ffffffffffffffffffffffffffffffffffffdffffffffffffffbfff3bfef3758200af1e9000b056d583cee7f5b24eee940cd5a2532dfd34143d7e605c06beb1c0b";
+    const MAINNET_453168000: &str = "831a1b02cb7f1a6ac1e9ff1a19b3b028";
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn decode_meta(cbor: &[u8]) -> SlotMeta {
+        Decoder::new(cbor).decode().unwrap()
+    }
+
+    fn encode_meta(meta: &SlotMeta) -> Vec<u8> {
+        let mut e = Encoder::new(Vec::new());
+        e.encode(meta).unwrap();
+        e.into_writer()
+    }
+
+    fn block_node(meta_cbor: &[u8]) -> Vec<u8> {
+        let mut e = Encoder::new(Vec::new());
+        e.array(6)
+            .unwrap()
+            .u64(2)
+            .unwrap()
+            .u64(448_940_256)
+            .unwrap();
+        e.array(0).unwrap().array(0).unwrap();
+        let mut out = e.into_writer();
+        out.extend_from_slice(meta_cbor);
+        out.push(0xf6); // rewards: null
+        out
+    }
+
+    #[test]
+    fn real_alpenglow_slot_meta_decodes_and_reencodes_byte_identical() {
+        let cbor = unhex(TESTNET_448940256);
+        let meta = decode_meta(&cbor);
+        assert_eq!(meta.parent_slot, Some(448_940_255));
+        assert_eq!(meta.blocktime, Some(1_791_223_953));
+        assert_eq!(meta.block_height, Some(400_525_716));
+        assert_eq!(meta.block_markers.as_ref().map(Vec::len), Some(2));
+        assert_eq!(meta.block_id.unwrap()[..4], [0x90, 0xba, 0xb6, 0xdc]);
+        assert_eq!(encode_meta(&meta), cbor);
+
+        let markers: Vec<BlockMarker<'_>> = meta
+            .parsed_block_markers()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        block_marker::validate_layout(&markers).unwrap();
+        let BlockMarker::Header(header) = markers[0] else {
+            panic!("expected header first");
+        };
+        assert_eq!(header.parent_slot, 448_940_255);
+        let footer = meta.block_footer().unwrap().unwrap();
+        assert_eq!(footer.block_producer_time_nanos, 1_791_223_953_881_712_687);
+        assert_eq!(
+            footer.block_producer_time_nanos / 1_000_000_000,
+            1_791_223_953
+        );
+        assert_eq!(footer.bank_hash[..4], [0x71, 0x94, 0x31, 0x0e]);
+        assert!(footer.block_user_agent.is_empty());
+        assert_eq!(footer.certificates.len(), 522);
+    }
+
+    #[test]
+    fn real_alpenglow_headers_chain_to_the_parent_block_id() {
+        let first = decode_meta(&unhex(TESTNET_448940256));
+        let second = decode_meta(&unhex(TESTNET_448940257));
+        let Some(Ok(BlockMarker::Header(ParentRef {
+            parent_slot,
+            parent_block_id,
+        }))) = second.parsed_block_markers().next()
+        else {
+            panic!("expected header first");
+        };
+        assert_eq!(parent_slot, 448_940_256);
+        assert_eq!(Some(parent_block_id), first.block_id);
+    }
+
+    #[test]
+    fn pre_alpenglow_slot_meta_stays_a_three_element_tuple() {
+        let cbor = unhex(MAINNET_453168000);
+        let meta = decode_meta(&cbor);
+        assert_eq!(meta.block_markers, None);
+        assert_eq!(meta.block_id, None);
+        assert_eq!(meta.block_footer().unwrap(), None);
+        assert_eq!(encode_meta(&meta), cbor);
+    }
+
+    #[test]
+    fn slot_meta_writes_null_gaps_and_omits_trailing_absent_fields() {
+        let meta = SlotMeta {
+            parent_slot: Some(1),
+            blocktime: Some(2),
+            block_height: None,
+            block_markers: Some(vec![vec![1, 0, 1, 0, 0]]),
+            block_id: None,
+        };
+        // [1, 2, null, [h'0100010000']]
+        assert_eq!(encode_meta(&meta), unhex("840102f681450100010000"));
+        assert_eq!(decode_meta(&encode_meta(&meta)), meta);
+    }
+
+    #[test]
+    fn slot_meta_rejects_a_block_id_that_is_not_32_bytes() {
+        // [1, 2, 3, null, h'00']
+        assert!(
+            Decoder::new(&unhex("85010203f64100"))
+                .decode::<SlotMeta>()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn block_node_decoders_read_alpenglow_slot_meta() {
+        let cbor = unhex(TESTNET_448940256);
+        let payload = block_node(&cbor);
+        let (slot, meta) = decode_block_metadata(&payload).unwrap();
+        assert_eq!(slot, 448_940_256);
+        assert_eq!(meta, decode_meta(&cbor));
+        let Node::Block(block) = decode_node(&payload).unwrap() else {
+            panic!("expected block");
+        };
+        assert_eq!(block.meta, meta);
+        assert!(block.rewards.is_none());
+    }
 
     #[test]
     fn dataframe_rejects_unsupported_next_array_shapes() {
