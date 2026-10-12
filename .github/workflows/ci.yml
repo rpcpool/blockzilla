@@ -40,18 +40,14 @@ jobs:
         run: cargo check --locked -p blockzilla --features developer-tools,archive-repair-tools --all-targets
       - name: Check user-program index commands and operational tools
         run: cargo check --locked -p blockzilla-user-program-index --features developer-tools --all-targets
-      # The PoH repair tests flake when other tests spawn child processes while they hold
-      # archive locks, so they run on their own, single-threaded.
       - name: Test workspace
-        run: >-
-          cargo test --workspace --lib --bins --tests --examples --locked --
-          --skip archive_verify::tests::poh_orphan_tail_repair
-      - name: Test PoH orphan tail repair
-        run: >-
-          cargo test --locked -p blockzilla --bin blockzilla --
-          archive_verify::tests::poh_orphan_tail_repair --test-threads=1
+        run: cargo test --workspace --exclude blockzilla --lib --bins --tests --examples --locked
+      # blockzilla's lock tests flake when other tests spawn child processes while they
+      # hold archive locks, so its tests run single-threaded.
+      - name: Test blockzilla
+        run: cargo test --locked -p blockzilla --bins --tests --examples -- --test-threads=1
       - name: Test workspace benches
-        run: cargo test --workspace --benches --locked
+        run: cargo test --workspace --bench '*' --locked
       - name: Test user-program index operational tools
         # Skipped: reads another process's /proc exe, which GitHub runners deny.
         run: >-
