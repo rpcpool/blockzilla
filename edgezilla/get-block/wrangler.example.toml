@@ -1,0 +1,31 @@
+name = "blockzilla-get-block-local"
+main = "build/index.js"
+compatibility_date = "2026-07-23"
+workers_dev = false
+
+[build]
+command = "worker-build --release . --no-default-features --features worker"
+
+[vars]
+BZ_ARCHIVE_SOURCE = "r2"
+BZ_ARCHIVE_PREFIX = "blockzilla-v2"
+BZ_R2_BUCKET_BINDING = "BZ_ARCHIVE_BUCKET"
+
+[[r2_buckets]]
+binding = "BZ_ARCHIVE_BUCKET"
+bucket_name = "REPLACE_WITH_ARCHIVE_BUCKET"
+
+[[kv_namespaces]]
+binding = "BZ_RPC_API_KEYS"
+id = "REPLACE_WITH_API_KEYS_KV_NAMESPACE_ID"
+
+[[analytics_engine_datasets]]
+binding = "BZ_RPC_METRICS"
+dataset = "blockzilla_rpc_metrics"
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true

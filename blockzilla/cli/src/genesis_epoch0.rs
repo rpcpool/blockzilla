@@ -1,0 +1,152 @@
+use anyhow::{Context, Result, anyhow};
+use of_car_reader::genesis::{GenesisArchive, MAINNET_GENESIS_URL, read_genesis_archive_from_file};
+use std::{
+    fs::File,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+};
+use tracing::info;
+
+pub(crate) const GENESIS_FILE: &str = "genesis.tar.bz2";
+
+/// Persist exact genesis bytes beside a compact epoch-0 generation.
+///
+/// Inline Archive V2 Genesis records intentionally retain their V2 schema and
+/// omit one launch field (`slots_per_segment`).  This tiny sidecar is therefore
+/// the authoritative, backwards-compatible runtime input.
+pub(crate) fn write_compact_sidecar(dir: &Path, archive: &GenesisArchive) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(blockzilla_archive_v2::ARCHIVE_V2_GENESIS_BIN_FILE);
+    if path.exists() {
+        let existing = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        anyhow::ensure!(
+            existing == archive.genesis_bin,
+            "refusing to replace mismatched compact genesis sidecar {}",
+            path.display()
+        );
+        return Ok(path);
+    }
+
+    let tmp = dir.join(format!(
+        "{}.tmp",
+        blockzilla_archive_v2::ARCHIVE_V2_GENESIS_BIN_FILE
+    ));
+    {
+        let mut file = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        file.write_all(&archive.genesis_bin)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        file.flush()
+            .with_context(|| format!("flush {}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))?;
+    Ok(path)
+}
+
+pub(crate) fn maybe_load_for_input(input: &Path) -> Result<Option<GenesisArchive>> {
+    if epoch_from_path(input) != Some(0) {
+        return Ok(None);
+    }
+    let path = ensure_for_input(input)?;
+    read_genesis_archive_from_file(&path)
+        .map(Some)
+        .map_err(|err| anyhow!("{err}"))
+        .with_context(|| format!("read {}", path.display()))
+}
+
+pub(crate) fn maybe_load_for_label(label: &str, dir: &Path) -> Result<Option<GenesisArchive>> {
+    if epoch_from_label(label) != Some(0) {
+        return Ok(None);
+    }
+    let path = ensure_in_dir(dir)?;
+    read_genesis_archive_from_file(&path)
+        .map(Some)
+        .map_err(|err| anyhow!("{err}"))
+        .with_context(|| format!("read {}", path.display()))
+}
+
+pub(crate) fn ensure_for_input(input: &Path) -> Result<PathBuf> {
+    let dir = input.parent().unwrap_or_else(|| Path::new("."));
+    ensure_in_dir(dir)
+}
+
+pub(crate) fn blockhash_registry_starts_with(path: &Path, hash: &[u8; 32]) -> Result<bool> {
+    let Ok(mut file) = File::open(path) else {
+        return Ok(false);
+    };
+    let mut first = [0u8; 32];
+    match file.read_exact(&mut first) {
+        Ok(()) => Ok(&first == hash),
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+pub(crate) fn add_pubkeys_to(archive: &GenesisArchive, mut add: impl FnMut(&[u8; 32])) {
+    for entry in archive
+        .genesis
+        .accounts
+        .iter()
+        .chain(archive.genesis.reward_pools.iter())
+    {
+        add(&entry.pubkey);
+        add(&entry.account.owner);
+    }
+
+    for builtin in &archive.genesis.builtins {
+        add(&builtin.pubkey);
+    }
+}
+
+fn ensure_in_dir(dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(GENESIS_FILE);
+    if path.is_file() && path.metadata().is_ok_and(|meta| meta.len() > 0) {
+        return Ok(path);
+    }
+
+    let tmp = dir.join(format!("{GENESIS_FILE}.tmp"));
+    info!(
+        "genesis archive missing; downloading {} to {}",
+        MAINNET_GENESIS_URL,
+        path.display()
+    );
+
+    let mut response = reqwest::blocking::get(MAINNET_GENESIS_URL)
+        .with_context(|| format!("download {MAINNET_GENESIS_URL}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("download {MAINNET_GENESIS_URL}: HTTP {status}");
+    }
+
+    {
+        let mut file = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        std::io::copy(&mut response, &mut file)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        file.flush()
+            .with_context(|| format!("flush {}", tmp.display()))?;
+    }
+
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))?;
+    Ok(path)
+}
+
+fn epoch_from_path(path: &Path) -> Option<u64> {
+    let file_name = path.file_name()?.to_str()?;
+    epoch_from_file_name(file_name)
+}
+
+fn epoch_from_label(label: &str) -> Option<u64> {
+    let without_query = label.split_once('?').map(|(head, _)| head).unwrap_or(label);
+    let file_name = without_query.rsplit('/').next().unwrap_or(without_query);
+    epoch_from_file_name(file_name)
+}
+
+fn epoch_from_file_name(file_name: &str) -> Option<u64> {
+    let rest = file_name.strip_prefix("epoch-")?;
+    let number = rest
+        .strip_suffix(".car.zst")
+        .or_else(|| rest.strip_suffix(".car"))?;
+    number.parse().ok()
+}

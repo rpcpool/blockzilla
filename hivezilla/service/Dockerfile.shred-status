@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.98-bookworm AS builder
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends cmake pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# gxhash requires the host AES/SIMD feature set. Dokploy builds and runs this image on the same
+# machine, so the native target used by the main shred image is safe here too.
+ENV RUSTFLAGS="-C target-cpu=native"
+ENV CARGO_PROFILE_RELEASE_LTO="false"
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=8
+
+WORKDIR /app
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --locked --release --package hivezilla --bin hivezilla \
+    && cp target/release/hivezilla /tmp/hivezilla
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates \
+    && groupadd --gid 10001 app \
+    && useradd --uid 10001 --gid app --create-home app \
+    && install --directory --owner app --group app /app /recorder-status /public-status \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /tmp/hivezilla /usr/local/bin/hivezilla
+
+USER app
+VOLUME ["/recorder-status", "/public-status"]
+ENTRYPOINT ["/usr/local/bin/hivezilla", "serve-shred-status"]

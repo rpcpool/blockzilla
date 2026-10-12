@@ -1,0 +1,20 @@
+[package]
+name = "blockzilla-read-car"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "read-car"
+path = "src/main.rs"
+
+[dependencies]
+of-car-reader = { path = "../../crates/old-faithful/of-car-reader", default-features = false, features = ["archive"] }
+blockzilla-example-workloads = { path = "../workloads" }
+bs58 = "0.5.1"
+
+[lints]
+workspace = true
