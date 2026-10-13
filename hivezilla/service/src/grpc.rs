@@ -550,7 +550,7 @@ pub async fn probe_grpc(config: GrpcProbeConfig) -> Result<GrpcProbeReport> {
             "block-meta".to_string(),
             SubscribeRequestFilterBlocksMeta {},
         )]),
-        entry: HashMap::from([("entry".to_string(), SubscribeRequestFilterEntry {})]),
+        entry: HashMap::from([("entry".to_string(), SubscribeRequestFilterEntry::default())]),
         commitment: Some(CommitmentLevel::Confirmed as i32),
         ..Default::default()
     };
@@ -2614,7 +2614,7 @@ fn compact_no_registry_logs(
                 decoded.len()
             );
             let lines: Vec<String> =
-                blockzilla_wincode::config::deserialize(&decoded, wincode_leb128_config())
+                wincode::config::deserialize(&decoded, wincode_leb128_config())
                     .context("decode live log string vector")?;
             report.zstd_log_streams_compacted += 1;
             report.log_lines_compacted = report
@@ -3065,7 +3065,7 @@ fn read_no_registry_block_frame<R: Read>(
         return Err(err).context("read no-registry block frame");
     }
     *remaining_bytes -= len as u64;
-    let block = blockzilla_wincode::config::deserialize(scratch, wincode_leb128_config())
+    let block = wincode::config::deserialize(scratch, wincode_leb128_config())
         .context("decode no-registry block frame")?;
     Ok(Some((u64::from(len_bytes) + len as u64, block)))
 }
@@ -5349,8 +5349,8 @@ mod grpc_parent_blockhash_tests {
             let owned = convert_grpc_message(&message, None).unwrap();
             let borrowed = read_borrowed_message(&message.encode_to_vec(), None).unwrap();
             assert_eq!(
-                blockzilla_wincode::config::serialize(&owned, wincode_leb128_config()).unwrap(),
-                blockzilla_wincode::config::serialize(&borrowed, wincode_leb128_config()).unwrap()
+                wincode::config::serialize(&owned, wincode_leb128_config()).unwrap(),
+                wincode::config::serialize(&borrowed, wincode_leb128_config()).unwrap()
             );
             message.config = Some(Default::default());
             let owned_error = convert_grpc_message(&message, None).err().unwrap();

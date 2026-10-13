@@ -471,6 +471,8 @@ fn reward_type_to_rpc(reward_type: i32) -> Option<&'static str> {
         RewardType::Rent => Some("Rent"),
         RewardType::Staking => Some("Staking"),
         RewardType::Voting => Some("Voting"),
+        RewardType::DeactivatedStake => Some("DeactivatedStake"),
+        RewardType::VatDebit => Some("VATDebit"),
         RewardType::Unspecified => None,
     }
 }
@@ -481,6 +483,8 @@ fn reward_type_to_rpc_borrowed(reward_type: borrowed_proto::RewardType) -> Optio
         borrowed_proto::RewardType::Rent => Some("Rent"),
         borrowed_proto::RewardType::Staking => Some("Staking"),
         borrowed_proto::RewardType::Voting => Some("Voting"),
+        borrowed_proto::RewardType::DeactivatedStake => Some("DeactivatedStake"),
+        borrowed_proto::RewardType::VATDebit => Some("VATDebit"),
         borrowed_proto::RewardType::Unspecified => None,
     }
 }
@@ -1784,6 +1788,18 @@ fn write_u64_array(w: &mut JsonWriter, values: &[u64]) -> Result<(), String> {
 mod tests {
     use super::*;
     use of_car_reader::versioned_transaction::{V1Message, V1TransactionConfig};
+
+    #[test]
+    fn renders_alpenglow_reward_types_like_agave() {
+        for (value, name) in [(5, "DeactivatedStake"), (6, "VATDebit")] {
+            assert_eq!(reward_type_to_rpc(value), Some(name));
+            assert_eq!(
+                reward_type_to_rpc_borrowed(borrowed_proto::RewardType::from(value)),
+                Some(name)
+            );
+        }
+        assert_eq!(reward_type_to_rpc(7), None);
+    }
 
     fn sample_v1_transaction<'a>(
         signature: &'a [u8; 64],
