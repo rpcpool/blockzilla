@@ -1,23 +1,75 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/old-faithful/car-reader",
-    "crates/blockzilla-log-parser",
-    "crates/blockzilla-format",
-    "crates/old-faithful/archive-importer",
-    "crates/old-faithful/get-block-worker",
-    "crates/live-producer",
-    "blockzilla", "crates/old-faithful/signature-index", "crates/replay-runtime",
-    "blockzilla-get-block-worker",
-    "crates/old-faithful/slot-ranges",
-    "crates/old-faithful/token-index",
-    "crates/old-faithful/account-index",
+    # Shared models, primitives, and byte sources.
+    "crates/blockzilla-model",
+    "crates/blockzilla-primitives",
+    "crates/blockzilla-live-format",
+    "crates/source/blockzilla-source",
+    "crates/source/blockzilla-source-local",
+    "crates/source/blockzilla-source-http",
+    "crates/source/blockzilla-source-cache",
+    "crates/solana-codec/solana-shred-codec",
+    "crates/parser/blockzilla-log-parser",
+    "crates/parser/blockzilla-program-logs",
+    "crates/parser/blockzilla-dex-parser",
+
+    # Formats and readers, grouped by archive family.
+    "crates/old-faithful/of-car-reader",
+    "crates/old-faithful/of-slot-ranges",
+    "crates/compact-v2/blockzilla-registry",
+    "crates/compact-v2/blockzilla-compact",
+    "crates/compact-v2/blockzilla-archive-v2",
+    "crates/compact-v2/blockzilla-compact-v2-reader",
+    "crates/archive-v3/blockzilla-archive-v3",
+    "crates/archive-v3/blockzilla-archive-v3-reader",
+    "crates/archive-v3/blockzilla-archive-v3-convert",
+    "crates/compat/blockzilla-read-sdk-legacy",
+
+    # Indexer applications and runtime experiments.
+    "indexer/blockzilla-user-program-index",
+    "indexer/blockzilla-spyx-query",
+    "indexer/blockzilla-token-transaction-dump",
+    "indexer/blockzilla-token-balance-audit",
+    "indexer/blockzilla-dump",
+    "runtime/blockzilla-replay",
+
+    # Product tools and services.
+    "blockzilla/cli",
+    "blockzilla/archive-gateway",
+    "blockzilla/monitor",
+    "hivezilla/service",
+    "hivezilla/protocol",
+    "hivezilla/object-store",
+    "hivezilla/ledger-compat",
+    "hivezilla/gossip-compat",
+    "edgezilla/get-block",
+    "edgezilla/of-get-block",
+
+    # Examples and measurement tools.
+    "examples/workloads",
+    "examples/read-car",
+    "examples/read-compact-v2",
+    "examples/read-archive-v3",
+    "examples/token-api",
+    "bench/reader-profile",
+    "bench/download-only",
+    "bench/archive-v3-measure",
 ]
-exclude = ["solana-prog/"]
+
+# Lints every workspace package inherits via `[lints] workspace = true`.
+#
+# unexpected_cfgs is deny because the blockzilla-format split silently deleted a
+# test: archive-v2 gated fixtures on `feature = "known-drift"` while only
+# program-logs declared that feature, and `feature =` cfgs are per-crate. Cargo
+# warned seven times and the warning was missed. As a deny it is a build error.
+[workspace.lints.rust]
+unexpected_cfgs = "deny"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.98"
 license = "MIT"
 repository = "https://github.com/FernoLabs/blockzilla"
 
@@ -26,11 +78,28 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = false
+strip = true
 debug = false
 incremental = false
 overflow-checks = false
 
+# wasm-bindgen needs the externref table's symbol name to generate Worker
+# catch wrappers. Strip debug information, but keep names in intermediate WASM.
+# https://github.com/cloudflare/workers-rs/issues/1014
+[profile.release.package.blockzilla-get-block]
+strip = "debuginfo"
+
+[profile.release.package.old-faithful-get-block]
+strip = "debuginfo"
+
 [profile.release-debug]
 inherits = "release"
 debug = true
+strip = false
+
+# clap's derive for blockzilla's large flat command tree produces a >2 MiB
+# stack frame at opt-level 0, which overflows libtest's default worker stack.
+# Keep this package's tests representative while compiling that generated
+# builder down to a bounded frame; release settings are unchanged.
+[profile.test.package.blockzilla]
+opt-level = 1

@@ -1,139 +1,104 @@
 # Blockzilla
 
-Blockzilla is Ferno's Solana archive tooling. The current project focus is Archive V2: a compact, indexed, block-oriented replacement for the old `compact.bin` experiments.
+Blockzilla is a Rust toolkit for turning Solana history into compact, indexed
+archive files for local streaming, scanning, filtering, and historical reads.
 
-This repository contains:
+The main product is the `blockzilla` CLI and the Blockzilla archive format. Both are
+pre-1.0, so pin the Git revision used to produce an archive.
 
-- CAR readers and Old Faithful compatibility helpers.
-- Archive V2 builders, repackers, analyzers, and read benchmarks.
-- Token instruction/event dumpers used to benchmark real index workloads such as USDC.
-- Cloudflare worker and slot-index helpers for serving historical `getBlock`.
+## Components
 
-## Current Benchmark Snapshot
+| Path | Role |
+| --- | --- |
+| [`blockzilla/`](blockzilla/README.md) | CLI, archive gateway, and monitor. |
+| [`hivezilla/`](hivezilla/README.md) | Live capture, replication, protocol, and storage. |
+| [`edgezilla/`](edgezilla/README.md) | Independently deployed Cloudflare Workers. |
+| [`crates/`](crates) | Archive formats, readers, byte sources, and parsers. |
+| [`indexer/`](indexer/README.md) | Index builders, queries, extraction, and audits. |
+| [`runtime/`](runtime/README.md) | Experimental transaction replay. |
+| [`examples/`](examples) | Archive reader examples and canonical V3 candidate checks. |
+| [`bench/`](bench) | Reader and conversion measurements. |
+| [`web/`](web/spyx-explorer/README.md) | Web applications. |
+| [`docs/`](docs/README.md) | Format specifications, architecture, and operating guides. |
+| [`scripts/`](scripts/README.md) | Build, benchmark, and operational helpers. |
 
-The latest lean benchmark report is in
-[docs/blockzilla-lean-storage-read-getblock-report-current-20260524.md](docs/blockzilla-lean-storage-read-getblock-report-current-20260524.md).
+Archive V3 is the canonical format intended to replace Archive V2. Its converter
+candidates can be read locally with `ia-read`. The `IndexerV3Archive` API and
+standard `read-archive-v3-*` workloads still read the frozen standalone prototype;
+they cannot read canonical converter output. The dedicated V3 reader crate now
+owns `CanonicalReader`, used by `ia-read` and the converter's index builders.
+The common reader interface and HTTP support for canonical V3 remain to be
+added, with cross-format fixture checks. See the
+[workspace structure](docs/design/workspace-restructure.md) for crate locations
+and the remaining migration work.
 
-Headline results from the current-code snapshot:
+For current reader use, start with the [format guide](docs/reference/archive-formats-and-read-sdk.md)
+and the [CAR](examples/read-car/README.md), [V2](examples/read-compact-v2/README.md),
+or [V3](examples/read-archive-v3/README.md) examples. V2 uses a bounded rolling
+pipeline and can write optional [indexed USDC balances](docs/reference/usdc-indexed-balances-v1.md)
+with a source-scoped public-key dictionary. The
+[rolling-pipeline comparison](docs/benchmarks/epoch-300-rolling-pipeline-2026-09-06.md)
+records full-epoch output checks for its frozen build. The later
+[dependency retest](docs/benchmarks/epoch-300-dependency-review-2026-09-06.md)
+checks V2 prefixes after the dependency update.
 
-- Epoch 920 token instruction scan: **1,025 blocks/s**, **1.47M tx/s** on one thread.
-- Epoch 920 Pump.fun scan: **1,017 blocks/s** on one thread, scaling to **3,959 blocks/s** and **5.69M tx/s** on eight threads.
-- Epoch 10 reader comparison: Blockzilla hot blocks read at **84.3k blocks/s** for token scanning versus **17.4k blocks/s** from CAR and **26.7k blocks/s** from CAR.zst.
-- `getBlock` 132-slot sample: Blockzilla averaged **483 ms** for `full`, **228 ms** for `signatures`, **274 ms** for `accounts`, and **1,030 ms** for `full + rewards`.
-- `blockBin` averaged **217 ms** without materialization and **389 ms** with materialization.
-
-## Current CLI
-
-Use the top-level `blockzilla` binary for new work:
-
-```bash
-cargo run --release -p blockzilla -- --help
-cargo run --release -p blockzilla -- build-archive-v2-hot-blocks \
-  /volume1/blockzilla/epoch-800.car.zst \
-  /home/ach/dev/blockzilla-v2/epoch-800 \
-  --level 1
-```
-
-The old `of-archive-importer` binary still exists for compatibility with older scripts, but new Archive V2 and token-benchmark commands should live under `blockzilla`.
-
-## Archive V2 Layout
-
-The current production-shaped epoch directory is:
+The shortest working newcomer path is:
 
 ```text
-epoch-N/
-  archive-v2-blocks.zstd        # one independent zstd frame per block
-  archive-v2-blocks.index       # external block offset/size table
-  archive-v2-meta.wincode       # archive-level records
-
-  registry.bin                  # epoch pubkey registry
-  registry_counts.bin           # usage counts for registry ordering
-  blockhash_registry.bin         # PoH blockhash registry
-  prev_blockhash_tail.bin        # recent blockhash seed handoff
-  vote_hash_registry.bin         # vote-program hash sidecar
-
-  signatures.bin
-  poh.wincode
-  shredding.wincode
+Old Faithful CAR -> Blockzilla -> local archive files
 ```
 
-Alternative benchmark layouts are also supported:
+The target system adds independent Hivezilla capture and raw custody,
+Blockzilla scheduling and catalog authority, fenced Hivezilla archive workers,
+cloud replication, Edgezilla serving, and local indexer streaming. See the
+[system schema](docs/architecture/full-system-schema.md) for that direction and
+the [Hivezilla implementation assessment](docs/architecture/hivezilla-v1-implementation-plan.md)
+for the code-to-target gap and ordered build gates.
 
-- `archive-v2-blocks.wincode`: raw uncompressed block blobs with the same index shape.
-- `archive-v2-blocks.wincode.zst`: whole-file zstd over the raw block stream.
-- CAR/CAR.ZST inputs for baseline read and token-index comparisons.
+## Quick start: build and read the fixture
 
-We will keep adding measured compression ratios and read speeds as the benchmark matrix stabilizes.
-
-## Common Commands
-
-Build a hot-block Archive V2 epoch:
+Use a Rust toolchain that meets the workspace `rust-version` in
+[`Cargo.toml`](Cargo.toml). Clone the repository and inspect the CLI:
 
 ```bash
-cargo run --release -p blockzilla -- build-archive-v2-hot-blocks \
-  /volume1/blockzilla/epoch-900.car.zst \
-  /home/ach/dev/blockzilla-v2/epoch-900 \
-  --level 1
+git clone https://github.com/FernoLabs/blockzilla.git
+cd blockzilla
+cargo run --locked -p blockzilla -- --help
 ```
 
-Repack block-zstd to raw blocks plus whole-file zstd:
+Build one block from the included fixture and read it back:
 
 ```bash
-cargo run --release -p blockzilla -- repack-archive-v2-hot-blocks-raw \
-  /home/ach/dev/blockzilla-v2/epoch-900/archive-v2-blocks.zstd \
-  /home/ach/dev/blockzilla-v2/epoch-900-raw \
-  --index /home/ach/dev/blockzilla-v2/epoch-900/archive-v2-blocks.index \
-  --level 1
+OUT="$(mktemp -d)"
+
+cargo run --locked -p blockzilla -- \
+  build-archive-v2-hot-blocks \
+  crates/old-faithful/of-car-reader/benches/fixtures/epoch-157-biggest.car \
+  "$OUT" \
+  --max-blocks 1 \
+  --no-access
+
+cargo run --locked -p blockzilla -- \
+  bench-archive-v2-hot-blocks \
+  "$OUT/archive-v2-blocks.zstd" \
+  --workers 1 \
+  --chunk-size 1
 ```
 
-Benchmark block reads:
+The fixture is only a smoke test. Full epochs can require hundreds of gigabytes
+across source, output, and temporary files; use a fresh output directory and
+keep the source archive immutable.
+
+## Development
 
 ```bash
-cargo run --release -p blockzilla -- bench-archive-v2-hot-blocks \
-  /home/ach/dev/blockzilla-v2/epoch-900/archive-v2-blocks.zstd \
-  --workers 4
-
-cargo run --release -p blockzilla -- bench-archive-v2-hot-blocks-raw \
-  /home/ach/dev/blockzilla-v2/epoch-900-raw/archive-v2-blocks.wincode \
-  --workers 8
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --locked
+cargo test --workspace --all-targets --locked
 ```
 
-Run the token-instruction dump benchmark:
+Read the [documentation index](docs/README.md) before working on formats,
+deployments, or credential-handling code. Cross-cutting future work and product
+decisions are tracked in the [project backlog](TODO.md).
 
-```bash
-cargo run --release -p blockzilla -- dump-token-instructions \
-  /home/ach/dev/blockzilla-v2/epoch-900/archive-v2-blocks.zstd \
-  /home/ach/dev/token-dumps/epoch-900-hot-zstd-w4 \
-  --registry /home/ach/dev/blockzilla-v2/epoch-900/registry.bin \
-  --workers 4 \
-  --no-output
-```
-
-For CAR inputs, pass the matching Blockzilla registry so event rows can use the same account ids:
-
-```bash
-cargo run --release -p blockzilla -- dump-usdc-token-events \
-  /volume1/blockzilla/epoch-900.car \
-  /home/ach/dev/token-dumps/epoch-900-car \
-  --format car \
-  --registry /home/ach/dev/blockzilla-v2/epoch-900/registry.bin
-```
-
-## Target Machine
-
-The current benchmark target is a UGREEN NASync DXP8800 class machine with:
-
-- 8 x Seagate Exos ST28000NM000C 28 TB HDDs.
-- 2 x Crucial P310 4 TB PCIe Gen4 NVMe SSDs used as cache.
-- 8 GB RAM, so builders must stay conservative with resident memory and avoid unnecessary concurrent disk-heavy jobs.
-
-This hardware shape matters: sequential throughput is good, memory is tight, and benchmark jobs should usually serialize full-epoch repacks/builds unless we are explicitly testing disk contention.
-
-## Development Notes
-
-- `crates/blockzilla-format` owns the Archive V2 data types, sidecar names, registry helpers, and readers/writers that should be shared by all binaries.
-- `crates/old-faithful/car-reader` owns CAR/CAR.ZST parsing and Old Faithful quirks.
-- `blockzilla` owns user-facing Archive V2 build, repack, analysis, and token benchmark commands.
-- `crates/old-faithful/*` should stay focused on Old Faithful compatibility, slot indexes, and worker support.
-
-Legacy `compact.bin` analyzers still exist as `analyze-compact` and `dump-compact-log-strings`, but they are not part of the current production path.
+Blockzilla is available under the [MIT License](LICENSE).

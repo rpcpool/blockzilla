@@ -1,0 +1,24 @@
+[package]
+name = "solana-gossip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Minimal local compatibility surface for shard of `solana-gossip` used by Blockzilla."
+publish = false
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+# Keep these value types on the versions Agave 4.3.0 resolves (wincode 0.6).
+solana-address = { version = "=2.7.0", features = ["serde", "wincode"] }
+solana-hash = { version = "=4.6.0", features = ["serde", "wincode"] }
+serde-big-array = "0.5.1"
+solana-keypair = { version = "=3.1.2" }
+solana-signature = { version = "=3.5.2", features = ["serde", "wincode"] }
+solana-sha256-hasher = { version = "3.1.0" }
+tracing = "0.1.44"
+wincode = "=0.6.1"
+
+[lints]
+workspace = true

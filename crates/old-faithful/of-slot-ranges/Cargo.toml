@@ -1,0 +1,77 @@
+[package]
+name = "of-slot-ranges"
+version = "0.2.0-rc.2"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Build and read Old Faithful slot-to-CAR range indexes"
+readme = "README.md"
+keywords = ["solana", "car", "index"]
+exclude = ["*.sh"]
+autobins = false
+
+[[bin]]
+name = "of-slot-ranges"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "of-car-slot-index"
+path = "src/bin/car_slot_index.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "of-repair-slot-ranges"
+path = "src/bin/repair_slot_ranges.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "of-validate-slot-index"
+path = "src/bin/validate_slot_index.rs"
+
+[[bin]]
+name = "of-validate-slot-index-v2"
+path = "src/bin/validate_slot_index_v2.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = [
+    "dep:bs58",
+    "dep:clap",
+    "dep:futures",
+    "dep:reqwest",
+    "dep:sha2",
+    "dep:time",
+    "dep:zstd",
+]
+
+[dependencies]
+anyhow = "1.0.104"
+of-car-reader = { path = "../of-car-reader", version = "=0.2.0", default-features = false, features = ["compact-index"] }
+bs58 = { version = "0.5.1", optional = true }
+clap = { version = "4.6.6", features = ["derive"], optional = true }
+futures = { version = "0.3.34", features = ["executor"], optional = true }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "blocking"], optional = true }
+sha2 = { version = "0.11.0", optional = true }
+time = { version = "0.3.55", features = ["formatting", "macros"], optional = true }
+zstd = { version = "0.14.0", optional = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[[bin]]
+name = "debug_epoch_gap"
+path = "src/bin/debug_epoch_gap.rs"
+
+[[bin]]
+name = "debug_epoch_slot_window"
+path = "src/bin/debug_epoch_slot_window.rs"
+
+[[bin]]
+name = "fetch_slot_slice"
+path = "src/bin/fetch_slot_slice.rs"
+
+[lints]
+workspace = true
