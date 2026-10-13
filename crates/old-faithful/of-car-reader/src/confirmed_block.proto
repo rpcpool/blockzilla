@@ -125,6 +125,10 @@ enum RewardType {
     Rent = 2;
     Staking = 3;
     Voting = 4;
+    // Alpenglow: stake reward paid to a deactivated stake account.
+    DeactivatedStake = 5;
+    // Alpenglow: vote account fee (VAT) debited at the epoch boundary; lamports are negative.
+    VATDebit = 6;
 }
 
 message Reward {
