@@ -5,8 +5,8 @@ use of_car_reader::{
     compact_index::decode_offset_and_size,
     node::{Node, decode_node},
     slot_ranges::{
-        SLOT_RANGE_ENTRY_SIZE, SLOTS_PER_EPOCH, SlotRange, SlotRangeWithPreviousBlockhash,
-        decode_slot_range_entry, epoch_for_slot, slot_in_epoch,
+        EpochSchedule, SLOT_RANGE_ENTRY_SIZE, SLOTS_PER_EPOCH, SlotRange,
+        SlotRangeWithPreviousBlockhash, decode_slot_range_entry,
         write_slot_ranges_raw as write_slot_ranges_raw_entries,
         write_slot_ranges_v2_raw as write_slot_ranges_v2_raw_entries,
     },
@@ -126,6 +126,26 @@ struct Cli {
     /// is provided only to decode the CAR header length.
     #[arg(long)]
     raw_only: bool,
+
+    /// Cluster whose epoch schedule maps epochs to slots (mainnet, testnet or devnet).
+    #[arg(long, default_value = "mainnet", value_parser = parse_epoch_schedule)]
+    cluster: EpochSchedule,
+}
+
+fn parse_epoch_schedule(cluster: &str) -> Result<EpochSchedule, String> {
+    EpochSchedule::for_cluster(cluster)
+        .ok_or_else(|| format!("unknown cluster {cluster:?} (expected mainnet, testnet or devnet)"))
+}
+
+/// `[start, end)` slots of `epoch`.
+fn epoch_slot_bounds(schedule: EpochSchedule, epoch: u64) -> Result<(u64, u64)> {
+    let start = schedule
+        .first_slot(epoch)
+        .ok_or_else(|| anyhow!("epoch {epoch} is a warmup epoch or overflows"))?;
+    let end = start
+        .checked_add(SLOTS_PER_EPOCH)
+        .ok_or_else(|| anyhow!("epoch end slot overflow for epoch {epoch}"))?;
+    Ok((start, end))
 }
 
 fn main() -> Result<()> {
@@ -234,6 +254,7 @@ fn run(cli: Cli) -> Result<()> {
                 let build_config = BuildSlotRangesConfig {
                     max_bucket_payload_bytes: MAX_BUCKET_SIZE,
                     allow_node_read_fallback: true,
+                    epoch_schedule: cli.cluster,
                 };
                 let first_build = futures::executor::block_on(build_slot_ranges_from_indexes(
                     epoch,
@@ -345,10 +366,13 @@ fn run(cli: Cli) -> Result<()> {
             let block_slots = match index_block_slots.take() {
                 Some(block_slots) => block_slots,
                 None => match cli.slot_list_dir.as_deref() {
-                    Some(slot_list_root) => {
-                        read_block_slots_from_old_faithful_slot_list(epoch, slot_list_root)?
-                    }
+                    Some(slot_list_root) => read_block_slots_from_old_faithful_slot_list(
+                        cli.cluster,
+                        epoch,
+                        slot_list_root,
+                    )?,
                     None => read_block_slots_from_old_faithful_index(
+                        cli.cluster,
                         epoch,
                         &cli.indexes_dir,
                         &http,
@@ -378,6 +402,7 @@ fn run(cli: Cli) -> Result<()> {
                 epoch_dir.display()
             );
             let v2 = build_slot_ranges_v2_from_blockhash_registry_sidecar(
+                cli.cluster,
                 &epoch_dir,
                 epoch,
                 &raw_ranges,
@@ -414,6 +439,7 @@ fn run(cli: Cli) -> Result<()> {
                 None => run_seed,
             };
             let v2 = build_slot_ranges_v2_from_archive_v2_sidecars(
+                cli.cluster,
                 &epoch_dir,
                 epoch,
                 &raw_ranges,
@@ -431,6 +457,7 @@ fn run(cli: Cli) -> Result<()> {
             let v2 = build_slot_ranges_v2_from_local_car(
                 &local_car_path,
                 epoch,
+                cli.cluster,
                 previous_epoch_last_blockhash.or_else(|| {
                     (epoch == cli.start_epoch)
                         .then_some(configured_seed)
@@ -454,6 +481,7 @@ fn run(cli: Cli) -> Result<()> {
 }
 
 fn read_block_slots_from_old_faithful_slot_list(
+    schedule: EpochSchedule,
     epoch: u64,
     slot_list_dir: &Path,
 ) -> Result<Vec<u64>> {
@@ -465,14 +493,18 @@ fn read_block_slots_from_old_faithful_slot_list(
     })?;
     let contents = fs::read_to_string(&path)
         .with_context(|| format!("read Old Faithful slot list {}", path.display()))?;
-    let decoded = decode_old_faithful_slot_list(&path, epoch, &contents)?;
+    let decoded = decode_old_faithful_slot_list(schedule, &path, epoch, &contents)?;
     if let Some(before) = decoded.before {
         if let Some(previous_path) = find_old_faithful_slot_list(slot_list_dir, epoch - 1)? {
             let previous_contents = fs::read_to_string(&previous_path).with_context(|| {
                 format!("read Old Faithful slot list {}", previous_path.display())
             })?;
-            let previous =
-                decode_old_faithful_slot_list(&previous_path, epoch - 1, &previous_contents)?;
+            let previous = decode_old_faithful_slot_list(
+                schedule,
+                &previous_path,
+                epoch - 1,
+                &previous_contents,
+            )?;
             let expected = previous.current.last().copied().ok_or_else(|| {
                 anyhow!(
                     "{} has no current-epoch block slots",
@@ -495,7 +527,8 @@ fn read_block_slots_from_old_faithful_slot_list(
         if let Some(next_path) = find_old_faithful_slot_list(slot_list_dir, next_epoch)? {
             let next_contents = fs::read_to_string(&next_path)
                 .with_context(|| format!("read Old Faithful slot list {}", next_path.display()))?;
-            let next = decode_old_faithful_slot_list(&next_path, next_epoch, &next_contents)?;
+            let next =
+                decode_old_faithful_slot_list(schedule, &next_path, next_epoch, &next_contents)?;
             let expected = next.current.first().copied().ok_or_else(|| {
                 anyhow!("{} has no current-epoch block slots", next_path.display())
             })?;
@@ -547,6 +580,7 @@ fn find_old_faithful_slot_list(root: &Path, epoch: u64) -> Result<Option<PathBuf
 }
 
 fn decode_old_faithful_slot_list(
+    schedule: EpochSchedule,
     path: &Path,
     epoch: u64,
     contents: &str,
@@ -580,12 +614,7 @@ fn decode_old_faithful_slot_list(
         })?);
     }
 
-    let epoch_start = epoch
-        .checked_mul(SLOTS_PER_EPOCH)
-        .ok_or_else(|| anyhow!("epoch start slot overflow for epoch {epoch}"))?;
-    let epoch_end = epoch_start
-        .checked_add(SLOTS_PER_EPOCH)
-        .ok_or_else(|| anyhow!("epoch end slot overflow for epoch {epoch}"))?;
+    let (epoch_start, epoch_end) = epoch_slot_bounds(schedule, epoch)?;
     let next_epoch_end = epoch_end
         .checked_add(SLOTS_PER_EPOCH)
         .ok_or_else(|| anyhow!("next epoch end overflow for epoch {epoch}"))?;
@@ -624,9 +653,15 @@ fn decode_old_faithful_slot_list(
         ));
     }
     if let Some(slot) = before.first().copied() {
-        let previous_epoch_start = epoch_start
-            .checked_sub(SLOTS_PER_EPOCH)
-            .ok_or_else(|| anyhow!("{} epoch 0 cannot have a before-epoch slot", path.display()))?;
+        let previous_epoch_start = epoch
+            .checked_sub(1)
+            .and_then(|previous| schedule.first_slot(previous))
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} epoch {epoch} cannot have a before-epoch slot",
+                    path.display()
+                )
+            })?;
         if slot < previous_epoch_start {
             return Err(anyhow!(
                 "{} before-epoch slot {slot} is outside adjacent epoch range {previous_epoch_start}..{epoch_start}",
@@ -657,6 +692,7 @@ fn decode_old_faithful_slot_list(
 }
 
 fn read_block_slots_from_old_faithful_index(
+    schedule: EpochSchedule,
     epoch: u64,
     indexes_dir: &Path,
     http: &Client,
@@ -690,6 +726,7 @@ fn read_block_slots_from_old_faithful_index(
         BuildSlotRangesConfig {
             max_bucket_payload_bytes: MAX_BUCKET_SIZE,
             allow_node_read_fallback: true,
+            epoch_schedule: schedule,
         },
     ))?;
     let block_slots = if has_duplicate_block_cids(&output.candidates) {
@@ -939,6 +976,7 @@ struct ArchiveV2BlockIndexRow {
 }
 
 fn build_slot_ranges_v2_from_archive_v2_sidecars(
+    schedule: EpochSchedule,
     epoch_dir: &Path,
     epoch: u64,
     raw_ranges: &[SlotRange],
@@ -955,6 +993,7 @@ fn build_slot_ranges_v2_from_archive_v2_sidecars(
     let block_index_path = epoch_dir.join(ARCHIVE_V2_BLOCK_INDEX_FILE);
     if !block_index_path.is_file() {
         return build_slot_ranges_v2_from_blockhash_registry_sidecar(
+            schedule,
             epoch_dir,
             epoch,
             raw_ranges,
@@ -975,7 +1014,7 @@ fn build_slot_ranges_v2_from_archive_v2_sidecars(
         }
     }
     let row_slots = rows.iter().map(|row| row.slot).collect::<Vec<_>>();
-    validate_ordered_block_slots(epoch, raw_ranges, &row_slots)?;
+    validate_ordered_block_slots(schedule, epoch, raw_ranges, &row_slots)?;
     let blockhashes = read_blockhash_registry(&epoch_dir.join(ARCHIVE_V2_BLOCKHASH_REGISTRY_FILE))?;
     let alignment =
         blockhash_registry_alignment(epoch, rows.len(), &blockhashes, initial_previous_blockhash)?;
@@ -999,8 +1038,10 @@ fn build_slot_ranges_v2_from_archive_v2_sidecars(
             )
         })?;
 
-        let idx =
-            usize::try_from(slot_in_epoch(row.slot)).context("slot-in-epoch exceeds usize")?;
+        let idx = schedule
+            .slot_in_epoch(row.slot)
+            .and_then(|slot| usize::try_from(slot).ok())
+            .context("slot-in-epoch exceeds usize")?;
         let range = raw_ranges[idx];
         if range.is_empty() {
             eprintln!(
@@ -1029,6 +1070,7 @@ fn build_slot_ranges_v2_from_archive_v2_sidecars(
 }
 
 fn build_slot_ranges_v2_from_blockhash_registry_sidecar(
+    schedule: EpochSchedule,
     epoch_dir: &Path,
     epoch: u64,
     raw_ranges: &[SlotRange],
@@ -1047,6 +1089,7 @@ fn build_slot_ranges_v2_from_blockhash_registry_sidecar(
         .copied()
         .filter(|range| !range.is_empty())
         .count();
+    let (epoch_start, _) = epoch_slot_bounds(schedule, epoch)?;
     let raw_block_slots: Vec<u64>;
     let block_slots = if let Some(slots) = index_block_slots {
         slots
@@ -1056,12 +1099,12 @@ fn build_slot_ranges_v2_from_blockhash_registry_sidecar(
             .copied()
             .enumerate()
             .filter_map(|(slot_in_epoch, range)| {
-                (!range.is_empty()).then(|| epoch * SLOTS_PER_EPOCH + slot_in_epoch as u64)
+                (!range.is_empty()).then(|| epoch_start + slot_in_epoch as u64)
             })
             .collect();
         &raw_block_slots
     };
-    validate_ordered_block_slots(epoch, raw_ranges, block_slots)?;
+    validate_ordered_block_slots(schedule, epoch, raw_ranges, block_slots)?;
     let alignment = blockhash_registry_alignment(
         epoch,
         block_slots.len(),
@@ -1072,13 +1115,12 @@ fn build_slot_ranges_v2_from_blockhash_registry_sidecar(
     let mut ranges = vec![SlotRangeWithPreviousBlockhash::EMPTY; SLOTS_PER_EPOCH as usize];
     let mut previous_blockhash = alignment.initial_previous_blockhash;
     let mut last_blockhash = None;
-    let epoch_start = epoch
-        .checked_mul(SLOTS_PER_EPOCH)
-        .ok_or_else(|| anyhow!("epoch start slot overflow for epoch {epoch}"))?;
 
     for (block_i, slot) in block_slots.iter().copied().enumerate() {
-        let slot_in_epoch =
-            usize::try_from(slot_in_epoch(slot)).context("slot-in-epoch exceeds usize")?;
+        let slot_in_epoch = schedule
+            .slot_in_epoch(slot)
+            .and_then(|slot| usize::try_from(slot).ok())
+            .context("slot-in-epoch exceeds usize")?;
         let range = raw_ranges[slot_in_epoch];
 
         let hash_index = block_i
@@ -1111,16 +1153,12 @@ fn build_slot_ranges_v2_from_blockhash_registry_sidecar(
 }
 
 fn validate_ordered_block_slots(
+    schedule: EpochSchedule,
     epoch: u64,
     raw_ranges: &[SlotRange],
     block_slots: &[u64],
 ) -> Result<()> {
-    let epoch_start = epoch
-        .checked_mul(SLOTS_PER_EPOCH)
-        .ok_or_else(|| anyhow!("epoch start slot overflow for epoch {epoch}"))?;
-    let epoch_end = epoch_start
-        .checked_add(SLOTS_PER_EPOCH)
-        .ok_or_else(|| anyhow!("epoch end slot overflow for epoch {epoch}"))?;
+    let (epoch_start, epoch_end) = epoch_slot_bounds(schedule, epoch)?;
     let mut member = vec![false; SLOTS_PER_EPOCH as usize];
     let mut previous_slot = None;
     for (position, slot) in block_slots.iter().copied().enumerate() {
@@ -1400,6 +1438,7 @@ fn find_archive_v2_blockhash_dir(
 fn build_slot_ranges_v2_from_local_car(
     path: &Path,
     epoch: u64,
+    schedule: EpochSchedule,
     initial_previous_blockhash: Option<[u8; 32]>,
 ) -> Result<SlotRangesV2Build> {
     let initial_previous_blockhash = require_epoch_seed(epoch, initial_previous_blockhash)?;
@@ -1448,10 +1487,12 @@ fn build_slot_ranges_v2_from_local_car(
                     .checked_add(entry.total_len as u64)
                     .ok_or_else(|| anyhow!("CAR range end overflow"))?;
 
-                if epoch_for_slot(block.slot) == epoch {
+                if schedule.epoch(block.slot) == Some(epoch) {
                     let len = u32::try_from(end.saturating_sub(start))
                         .context("CAR block range exceeds u32")?;
-                    let idx = usize::try_from(slot_in_epoch(block.slot))
+                    let idx = schedule
+                        .slot_in_epoch(block.slot)
+                        .and_then(|slot| usize::try_from(slot).ok())
                         .context("slot-in-epoch exceeds usize")?;
                     ranges[idx] = SlotRangeWithPreviousBlockhash {
                         range: SlotRange { offset: start, len },
@@ -1794,6 +1835,7 @@ mod tests {
             overwrite: false,
             overwrite_v2: true,
             raw_only: false,
+            cluster: EpochSchedule::MAINNET,
         })
         .expect("direct slot-list build must not read compact indexes, CID indexes, or CARs");
 
@@ -1828,8 +1870,13 @@ mod tests {
         let after = epoch_end + 11;
         let valid = format!("{before}\n{}\n{}\n{after}\n", epoch_start, epoch_start + 2);
         assert_eq!(
-            decode_old_faithful_slot_list(Path::new("fixture.slots.txt"), epoch, &valid)
-                .expect("decode valid list"),
+            decode_old_faithful_slot_list(
+                EpochSchedule::MAINNET,
+                Path::new("fixture.slots.txt"),
+                epoch,
+                &valid
+            )
+            .expect("decode valid list"),
             DecodedOldFaithfulSlotList {
                 before: Some(before),
                 current: vec![epoch_start, epoch_start + 2],
@@ -1837,8 +1884,13 @@ mod tests {
             }
         );
         assert_eq!(
-            decode_old_faithful_slot_list(Path::new("0.slots.txt"), 0, "0\n2\n")
-                .expect("epoch zero has no predecessor line"),
+            decode_old_faithful_slot_list(
+                EpochSchedule::MAINNET,
+                Path::new("0.slots.txt"),
+                0,
+                "0\n2\n"
+            )
+            .expect("epoch zero has no predecessor line"),
             DecodedOldFaithfulSlotList {
                 before: None,
                 current: vec![0, 2],
@@ -1872,8 +1924,13 @@ mod tests {
             ),
         ];
         for (contents, expected) in malformed {
-            let error = decode_old_faithful_slot_list(Path::new("bad.slots.txt"), epoch, &contents)
-                .expect_err("malformed slot list must fail");
+            let error = decode_old_faithful_slot_list(
+                EpochSchedule::MAINNET,
+                Path::new("bad.slots.txt"),
+                epoch,
+                &contents,
+            )
+            .expect_err("malformed slot list must fail");
             assert!(
                 error.to_string().contains(expected),
                 "error {error:#} does not contain {expected:?}"
@@ -1884,8 +1941,12 @@ mod tests {
             let temporary = tempfile::tempdir().expect("temporary directory");
             fs::write(temporary.path().join(name), &valid).expect("write named slot list");
             assert_eq!(
-                read_block_slots_from_old_faithful_slot_list(epoch, temporary.path())
-                    .expect("read supported local name"),
+                read_block_slots_from_old_faithful_slot_list(
+                    EpochSchedule::MAINNET,
+                    epoch,
+                    temporary.path()
+                )
+                .expect("read supported local name"),
                 vec![epoch_start, epoch_start + 2]
             );
         }
@@ -1905,8 +1966,12 @@ mod tests {
         )
         .expect("write next list");
         assert_eq!(
-            read_block_slots_from_old_faithful_slot_list(epoch, temporary.path())
-                .expect("cross-check adjacent lists"),
+            read_block_slots_from_old_faithful_slot_list(
+                EpochSchedule::MAINNET,
+                epoch,
+                temporary.path()
+            )
+            .expect("cross-check adjacent lists"),
             vec![epoch_start, epoch_start + 2]
         );
         fs::write(
@@ -1914,8 +1979,12 @@ mod tests {
             format!("{previous_start}\n{}\n", previous_last - 1),
         )
         .expect("write mismatched previous list");
-        let error = read_block_slots_from_old_faithful_slot_list(epoch, temporary.path())
-            .expect_err("mismatched adjacent predecessor must fail");
+        let error = read_block_slots_from_old_faithful_slot_list(
+            EpochSchedule::MAINNET,
+            epoch,
+            temporary.path(),
+        )
+        .expect_err("mismatched adjacent predecessor must fail");
         assert!(
             error
                 .to_string()
@@ -1949,6 +2018,7 @@ mod tests {
         };
 
         let output = build_slot_ranges_v2_from_blockhash_registry_sidecar(
+            EpochSchedule::MAINNET,
             &epoch_dir,
             4,
             &raw_ranges,
@@ -1976,8 +2046,9 @@ mod tests {
             vec![epoch_start - 1],
             vec![epoch_start + SLOTS_PER_EPOCH],
         ] {
-            let error = validate_ordered_block_slots(epoch, &raw_ranges, &slots)
-                .expect_err("invalid ordered slots must fail");
+            let error =
+                validate_ordered_block_slots(EpochSchedule::MAINNET, epoch, &raw_ranges, &slots)
+                    .expect_err("invalid ordered slots must fail");
             assert!(
                 error.to_string().contains("strictly increasing")
                     || error.to_string().contains("outside epoch")
@@ -1991,8 +2062,13 @@ mod tests {
         let epoch_start = epoch * SLOTS_PER_EPOCH;
         let mut raw_ranges = vec![SlotRange::EMPTY; SLOTS_PER_EPOCH as usize];
         raw_ranges[2] = SlotRange { offset: 59, len: 1 };
-        let error = validate_ordered_block_slots(epoch, &raw_ranges, &[epoch_start])
-            .expect_err("raw-present slot must be in the compact slot list");
+        let error = validate_ordered_block_slots(
+            EpochSchedule::MAINNET,
+            epoch,
+            &raw_ranges,
+            &[epoch_start],
+        )
+        .expect_err("raw-present slot must be in the compact slot list");
         assert!(error.to_string().contains("raw-present slot"));
     }
 
@@ -2044,6 +2120,7 @@ mod tests {
         let raw_ranges = vec![SlotRange::EMPTY; SLOTS_PER_EPOCH as usize];
         let seed = mainnet_genesis_hash().expect("mainnet genesis hash");
         let output = build_slot_ranges_v2_from_blockhash_registry_sidecar(
+            EpochSchedule::MAINNET,
             temporary.path(),
             0,
             &raw_ranges,
@@ -2173,6 +2250,7 @@ mod tests {
 
         assert_eq!(
             read_block_slots_from_old_faithful_index(
+                EpochSchedule::MAINNET,
                 4,
                 temporary.path(),
                 &Client::new(),
@@ -2302,6 +2380,7 @@ mod tests {
         };
 
         let output = build_slot_ranges_v2_from_archive_v2_sidecars(
+            EpochSchedule::MAINNET,
             &epoch_dir,
             1,
             &raw_ranges,
@@ -2321,6 +2400,7 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let raw_ranges = vec![SlotRange::EMPTY; SLOTS_PER_EPOCH as usize];
         let error = build_slot_ranges_v2_from_archive_v2_sidecars(
+            EpochSchedule::MAINNET,
             temporary.path(),
             1,
             &raw_ranges,
@@ -2331,6 +2411,7 @@ mod tests {
         assert!(error.to_string().contains("last blockhash from epoch 0"));
 
         let error = build_slot_ranges_v2_from_archive_v2_sidecars(
+            EpochSchedule::MAINNET,
             temporary.path(),
             1,
             &raw_ranges,

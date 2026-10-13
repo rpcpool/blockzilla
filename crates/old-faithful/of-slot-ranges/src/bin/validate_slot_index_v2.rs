@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use of_car_reader::{
     compact_index::decode_offset_and_size,
     slot_ranges::{
-        SLOT_RANGE_ENTRY_SIZE, SLOT_RANGE_V2_ENTRY_SIZE, SLOTS_PER_EPOCH, SlotRange,
+        EpochSchedule, SLOT_RANGE_ENTRY_SIZE, SLOT_RANGE_V2_ENTRY_SIZE, SLOTS_PER_EPOCH, SlotRange,
         decode_slot_range_entry, decode_slot_range_v2_entry,
     },
 };
@@ -896,6 +896,7 @@ fn read_old_faithful_block_candidates(
         BuildSlotRangesConfig {
             max_bucket_payload_bytes: MAX_BUCKET_SIZE,
             allow_node_read_fallback: true,
+            epoch_schedule: EpochSchedule::MAINNET,
         },
     ))?;
     Ok((output.candidates, cid_index_path))
@@ -1050,6 +1051,7 @@ fn build_canonical_old_faithful_ranges(
         BuildSlotRangesConfig {
             max_bucket_payload_bytes: MAX_BUCKET_SIZE,
             allow_node_read_fallback: true,
+            epoch_schedule: EpochSchedule::MAINNET,
         },
         block_slots,
     ))?;

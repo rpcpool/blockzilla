@@ -3,7 +3,7 @@ use of_car_reader::compact_index::{
     BUCKET_HEADER_SIZE, CompactIndexHeader, CompactIndexMeta, bst_lookup, bucket_hash,
     decode_offset_and_size, truncate_entry_hash,
 };
-use of_car_reader::slot_ranges::{SLOTS_PER_EPOCH, SlotRange};
+use of_car_reader::slot_ranges::{EpochSchedule, SLOTS_PER_EPOCH, SlotRange};
 use of_car_reader::{
     CarBlockReader,
     node::{Node, decode_node},
@@ -20,6 +20,7 @@ pub const DEFAULT_MAX_BUCKET_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 pub struct BuildSlotRangesConfig {
     pub max_bucket_payload_bytes: usize,
     pub allow_node_read_fallback: bool,
+    pub epoch_schedule: EpochSchedule,
 }
 
 impl Default for BuildSlotRangesConfig {
@@ -27,6 +28,7 @@ impl Default for BuildSlotRangesConfig {
         Self {
             max_bucket_payload_bytes: DEFAULT_MAX_BUCKET_PAYLOAD_BYTES,
             allow_node_read_fallback: false,
+            epoch_schedule: EpochSchedule::MAINNET,
         }
     }
 }
@@ -132,9 +134,7 @@ where
         ));
     }
 
-    let epoch_start_slot = epoch
-        .checked_mul(SLOTS_PER_EPOCH)
-        .ok_or_else(|| anyhow!("epoch start slot overflow"))?;
+    let epoch_start_slot = epoch_first_slot(config.epoch_schedule, epoch)?;
     let cid_value_size = slot_index.value_size();
     let bitset_len = (SLOTS_PER_EPOCH as usize).div_ceil(8);
     let mut stats = BuildBlockSlotsStats {
@@ -250,7 +250,8 @@ where
     S: RangeReader,
 {
     let output = build_block_slot_candidates_from_slot_index(epoch, slot_index, config).await?;
-    let selected = select_block_slot_candidates(epoch, &output.candidates, None)?;
+    let selected =
+        select_block_slot_candidates(config.epoch_schedule, epoch, &output.candidates, None)?;
     Ok(BuildBlockSlotsOutput {
         block_slots: selected
             .into_iter()
@@ -471,14 +472,16 @@ where
         ));
     }
 
-    let epoch_start_slot = epoch
-        .checked_mul(SLOTS_PER_EPOCH)
-        .ok_or_else(|| anyhow!("epoch start slot overflow"))?;
+    let epoch_start_slot = epoch_first_slot(config.epoch_schedule, epoch)?;
     let bitset_len = (SLOTS_PER_EPOCH as usize).div_ceil(8);
     let candidate_output =
         build_block_slot_candidates_from_slot_index(epoch, slot_index, config).await?;
-    let selected_candidates =
-        select_block_slot_candidates(epoch, &candidate_output.candidates, resolved_block_slots)?;
+    let selected_candidates = select_block_slot_candidates(
+        config.epoch_schedule,
+        epoch,
+        &candidate_output.candidates,
+        resolved_block_slots,
+    )?;
     let mut stats = BuildSlotRangesStats {
         present_slots: u32::try_from(selected_candidates.len())
             .map_err(|_| anyhow!("resolved block slot count exceeds u32"))?,
@@ -614,6 +617,12 @@ where
     })
 }
 
+fn epoch_first_slot(epoch_schedule: EpochSchedule, epoch: u64) -> Result<u64> {
+    epoch_schedule
+        .first_slot(epoch)
+        .ok_or_else(|| anyhow!("epoch {epoch} is a warmup epoch or overflows"))
+}
+
 fn canonical_range_for_block_end(
     car_header_size: u64,
     previous_end: &mut Option<u64>,
@@ -640,13 +649,12 @@ fn canonical_range_for_block_end(
 }
 
 fn select_block_slot_candidates<'a>(
+    epoch_schedule: EpochSchedule,
     epoch: u64,
     candidates: &'a [BlockSlotCandidate],
     resolved_block_slots: Option<&[u64]>,
 ) -> Result<Vec<&'a BlockSlotCandidate>> {
-    let epoch_start = epoch
-        .checked_mul(SLOTS_PER_EPOCH)
-        .ok_or_else(|| anyhow!("epoch start slot overflow"))?;
+    let epoch_start = epoch_first_slot(epoch_schedule, epoch)?;
     let epoch_end = epoch_start
         .checked_add(SLOTS_PER_EPOCH)
         .ok_or_else(|| anyhow!("epoch end slot overflow"))?;

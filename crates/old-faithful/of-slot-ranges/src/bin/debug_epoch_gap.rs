@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use of_car_reader::{
     compact_index::decode_offset_and_size,
-    slot_ranges::{SLOT_RANGE_ENTRY_SIZE, SLOTS_PER_EPOCH, decode_slot_range_entry},
+    slot_ranges::{EpochSchedule, SLOT_RANGE_ENTRY_SIZE, SLOTS_PER_EPOCH, decode_slot_range_entry},
 };
 use of_slot_ranges::{
     AsyncCompactIndex, BuildSlotRangesConfig, LocalFileRangeReader,
@@ -66,6 +66,7 @@ fn main() -> Result<()> {
         BuildSlotRangesConfig {
             max_bucket_payload_bytes: MAX_BUCKET_SIZE,
             allow_node_read_fallback: true,
+            epoch_schedule: EpochSchedule::MAINNET,
         },
     ))?;
 
