@@ -18,7 +18,7 @@
     "@sveltejs/kit": "^2.70.3",
     "lightweight-charts": "5.2.1",
     "svelte": "^5.57.0",
-    "vite": "^8.2.2"
+    "vite": "^8.3.5"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.10",
