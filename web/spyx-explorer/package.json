@@ -21,7 +21,7 @@
     "vite": "^8.2.2"
   },
   "devDependencies": {
-    "@sveltejs/adapter-static": "^3.0.10",
+    "@sveltejs/adapter-static": "^3.0.11",
     "@types/node": "^26.4.1",
     "svelte-check": "^4.7.6",
     "typescript": "^6.0.3"
